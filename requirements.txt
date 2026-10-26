@@ -1,0 +1,9 @@
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+faster-whisper==1.2.1
+numpy==2.5.4
+opencv-python-headless==4.14.0.94
+anthropic==1.13.0
+pyobjc-framework-Vision==12.2.2
+pyobjc-framework-Quartz==12.2.2
