@@ -123,12 +123,12 @@ def _anthropic_client():
     return anthropic.Anthropic(api_key=key, base_url="https://api.anthropic.com", max_retries=3, timeout=600)
 
 
-def call_anthropic(prompt, model) -> tuple[dict, dict]:
+def call_anthropic(prompt, model, system=None, schema=None) -> tuple[dict, dict]:
     import anthropic
     client = _anthropic_client()
-    kwargs = dict(model=model, max_tokens=16000, system=SYSTEM,
+    kwargs = dict(model=model, max_tokens=16000, system=system or SYSTEM,
                   messages=[{"role": "user", "content": prompt}],
-                  output_config={"format": {"type": "json_schema", "schema": SCHEMA}})
+                  output_config={"format": {"type": "json_schema", "schema": schema or SCHEMA}})
     if model in ("claude-opus-5-5", "claude-sonnet-5-5"):
         # Server-side fallback: if a safety classifier declines, Anthropic retries on a suitable model.
         fb = dict(extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
@@ -210,3 +210,147 @@ def check_local(base_url) -> dict:
         return {"ok": True, "models": [m.get("id") for m in data.get("data", [])]}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ================================================================== whole-webinar "viral strategist" brief
+# Used for Claude and for "Your own AI chat" (paste into Gemini / ChatGPT). The model sees the WHOLE
+# transcript (like asking Gemini about the video), ranks globally, and returns rich, ready-to-use fields.
+LANGUAGES = {"en": "English"}
+
+VIRAL_SYSTEM = """You are a senior short-form video strategist for TikTok, Instagram Reels and YouTube Shorts. \
+You read a full webinar transcript and pick the moments with the highest potential to perform on social media \
+as standalone clips.
+
+What makes a strong clip: a hook in the first seconds (a bold claim, a surprising analogy, a relatable problem, \
+a question); one clear idea that a brand-new viewer understands without the rest of the webinar; memorable \
+analogies and stories; practical, actionable takeaways; a satisfying ending (the idea lands). Prefer the moments \
+people would share, save or comment on. Avoid housekeeping, slide navigation, long setups and answers that depend \
+on earlier context.
+
+Rules:
+- Choose clips ONLY by sentence ID (start_id..end_id, inclusive). Never rewrite or invent the speaker's words.
+- key_start_id..key_end_id = the single most quotable sentence(s) inside the clip (the "money line").
+- title = a short theme name for the clip, like a chapter title.
+- hook = on-screen text for the first 3 seconds (max 12 words). caption = a ready-to-post caption or \
+text-on-screen line. Both must be faithful to what is said: no invented numbers, facts or quotes.
+- why = 1–3 sentences: why this works as a Reel and who it is for.
+- editing_tips = 1–3 concrete tips for this clip (e.g. what visual to show when the speaker mentions something).
+- viral = "very_high" only for the best 1–2 clips, otherwise "high" or "medium". It is an honest judgement, \
+not a promise.
+- scores = honest 1–10 judgements; caveats = real weaknesses (e.g. "refers to the slide", "slow start").
+- LENGTH IS A HARD RULE: every clip's duration (end time of end_id minus start time of start_id) must be inside \
+the requested range. Check it with the timestamps before answering and put it in duration_seconds. If a great \
+moment is longer, choose the strongest part of it that fits; if it is shorter, include the sentences around it.
+- Rank from best to worst. Prefer fewer, excellent clips over many weak ones."""
+
+VIRAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "candidates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start_id": {"type": "integer"}, "end_id": {"type": "integer"},
+                    "duration_seconds": {"type": "integer"},
+                    "key_start_id": {"type": "integer"}, "key_end_id": {"type": "integer"},
+                    "title": {"type": "string"}, "topic": {"type": "string"},
+                    "viral": {"type": "string", "enum": ["very_high", "high", "medium"]},
+                    "hook": {"type": "string"}, "caption": {"type": "string"}, "why": {"type": "string"},
+                    "editing_tips": {"type": "array", "items": {"type": "string"}},
+                    "scores": {
+                        "type": "object",
+                        "properties": {k: {"type": "integer"} for k in
+                                       ("hook", "clarity", "standalone", "usefulness", "engagement")},
+                        "required": ["hook", "clarity", "standalone", "usefulness", "engagement"],
+                        "additionalProperties": False,
+                    },
+                    "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "caveats": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["start_id", "end_id", "duration_seconds", "key_start_id", "key_end_id", "title", "topic", "viral", "hook",
+                             "caption", "why", "editing_tips", "scores", "confidence", "caveats"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["candidates"],
+    "additionalProperties": False,
+}
+
+EXAMPLE = {"candidates": [{
+    "start_id": 120, "end_id": 127, "duration_seconds": 0, "key_start_id": 121, "key_end_id": 122,
+    "title": "Analogy: AI is an intern", "topic": "AI basics", "viral": "very_high",
+    "hook": "Why your AI results are still bad", "caption": "Treat AI like a smart intern who needs direction.",
+    "why": "A simple, relatable analogy that explains a common frustration.",
+    "editing_tips": ["Show AI logos when he lists ChatGPT, Gemini and Claude"],
+    "scores": {"hook": 9, "clarity": 8, "standalone": 9, "usefulness": 8, "engagement": 9},
+    "confidence": "high", "caveats": []}]}
+
+
+def build_global_prompt(sents, min_dur, max_dur, count, avoid, slide_marks, language="en", for_chat=False):
+    lang = LANGUAGES["en"]
+
+    def line(s):
+        mark = " [slide changes]" if s["id"] in slide_marks else ""
+        return f"[S{s['id']} {fmt_time(s['start'])}–{fmt_time(s['end'])}]{mark} {s['text']}"
+
+    lo, hi = int(min_dur), int(max_dur)
+    task = (f"Pick the {count} best clips for social media from the whole webinar below — exactly {count} clips, "
+            f"each about a different moment.\n"
+            f"CLIP LENGTH: every clip must be {lo} to {hi} seconds long — not shorter than {lo} s and not longer "
+            f"than {hi} s. Aim for about {round(lo + (hi - lo) * 0.7)} seconds: use the whole idea with its setup and "
+            f"payoff, don't stop at the minimum. Measure it with the timestamps (end of the last sentence minus start "
+            f"of the first).\n"
+            f"Write title, hook, caption, why, editing_tips and caveats in {lang}.")
+    if avoid:
+        task += " These ranges were already suggested — pick DIFFERENT moments that do not overlap them: " + \
+                ", ".join(f"S{a}–S{b}" for a, b in avoid) + "."
+    body = "TRANSCRIPT (each line: [S<id> start–end] text):\n" + "\n".join(line(s) for s in sents)
+    if not for_chat:
+        return task + "\n\n" + body
+    # self-contained version to paste into Gemini / ChatGPT / Claude.ai
+    return (VIRAL_SYSTEM + "\n\n" + task + "\n\n"
+            "ANSWER FORMAT: reply with ONLY one JSON code block (```json ... ```), no other text. The example below "
+            f"shows the fields of ONE clip; your \"candidates\" list must contain {count} clip objects like it "
+            "(the example's content is made up — use the real transcript):\n"
+            + json.dumps(EXAMPLE, ensure_ascii=False, indent=1) + "\n"
+            "Use the S-numbers from the transcript for start_id, end_id, key_start_id and key_end_id. "
+            "viral is one of very_high, high, medium; confidence one of low, medium, high. "
+            f"duration_seconds = the real length of the clip from the timestamps (must be {lo}–{hi}; the 0 in the "
+            "example is only a placeholder).\n\n" + body +
+            f"\n\nREMINDER: \"candidates\" must contain {count} clips (not 1), each {lo} to {hi} seconds long, "
+            f"ideally about {round(lo + (hi - lo) * 0.7)} s "
+            "(check the timestamps). "
+            "Reply with only the JSON code block.")
+
+
+def parse_chat_answer(text: str) -> dict:
+    """Read the JSON an AI chat answered with (tolerates code fences, extra text, smart quotes)."""
+    t = (text or "").strip()
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", t, re.S)
+    raw = m.group(1) if m else (t[t.find("{"): t.rfind("}") + 1] if "{" in t else "")
+    if not raw and "{" in t:
+        raise UserError("The pasted answer seems cut off (it doesn't end properly). Ask the AI: “Please send the "
+                        "complete JSON again in one code block”, then paste it here.")
+    if not raw:
+        raise UserError("No answer found. Paste the AI's whole reply (the part that starts with ```json or {).")
+    for attempt in (raw, raw.replace("“", '"').replace("”", '"').replace("’", "'")):
+        try:
+            data = json.loads(attempt)
+            break
+        except json.JSONDecodeError:
+            data = None
+    if data is None:
+        raise UserError("The pasted answer isn't valid JSON — it may be cut off. Ask the AI: “Please send the "
+                        "complete JSON again in one code block”, then paste it here.")
+    if isinstance(data, list):
+        data = {"candidates": data}
+    if not isinstance(data.get("candidates"), list) or not data["candidates"]:
+        raise UserError("The answer has no clips in it (expected a “candidates” list).")
+    return data
+
+
+def call_anthropic_rich(prompt, model):
+    """Claude with the whole-webinar brief and the rich schema."""
+    return call_anthropic(prompt, model, system=VIRAL_SYSTEM, schema=VIRAL_SCHEMA)

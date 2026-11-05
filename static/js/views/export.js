@@ -4,6 +4,7 @@ import { h, toast, fmtTime, fmtBytes, progressBar, errorBox, select, slider } fr
 import { LAYOUTS } from "../compose.js";
 import { startRender } from "../clipstate.js";
 import { editorShell } from "./editorshell.js";
+import { clipDur, hasCuts } from "../cuts.js";
 
 export async function render(main, ctx) {
   const ed = await editorShell(main, ctx, { step: "export", title: "7. Preview & export",
@@ -20,7 +21,7 @@ export async function render(main, ctx) {
   const summary = h("div", { class: "card" },
     h("h3", {}, "Summary"),
     h("dl", { class: "kv" },
-      h("dt", {}, "Webinar time"), h("dd", {}, `${fmtTime(clip.start)} – ${fmtTime(clip.end)} (${(clip.end - clip.start).toFixed(1)} s)`),
+      h("dt", {}, "Webinar time"), h("dd", {}, `${fmtTime(clip.start)} – ${fmtTime(clip.end)} (${clipDur(clip).toFixed(1)} s${hasCuts(clip) ? `, ${(clip.end - clip.start - clipDur(clip)).toFixed(1)} s of silences/fillers removed` : ""})`),
       h("dt", {}, "Sync offset"), h("dd", {}, `${p.sync.offset >= 0 ? "+" : ""}${p.sync.offset.toFixed(2)} s`),
       h("dt", {}, "Layouts"), h("dd", {}, clip.segments.map((s) => `${fmtTime(s.t, 1)} ${LAYOUTS[s.layout].short}${s.motion && s.motion !== "none" ? " (" + s.motion + ")" : ""}`).join(" → ")),
       h("dt", {}, "Transitions"), h("dd", {}, clip.transition.type === "cut" ? "hard cut" : `${clip.transition.type}, ${clip.transition.dur}s`),

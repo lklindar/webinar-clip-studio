@@ -4,6 +4,7 @@
 //   {fill: "#hex", d: [...], a}  solid rectangle
 // The browser draws these ops on a canvas for the preview; the Python renderer executes the
 // very same ops (sampled per output frame) with OpenCV for the final MP4.
+import { clipDur, toEdit, editWords } from "./cuts.js";
 
 export const OUT_W = 1080;
 export const OUT_H = 1920;
@@ -69,7 +70,25 @@ export function assetOf(seg) {
 }
 export const ASSET_PLACES = { top: "On top (speaker below)", full: "Full screen", card: "Card over the speaker" };
 
+// "Header & safe zone" edit style: everything sits between a header band (title + logo) at the top and
+// an empty band at the bottom (kept free for the app buttons and captions of TikTok / Reels / Shorts).
+export const FRAME_STYLE = { top: 0.155, bottom: 0.19 };
+export const frameOn = (clip) => !!clip?.frame?.on;
+export function contentBox(clip) {
+  if (!frameOn(clip)) return { y: 0, h: OUT_H };
+  const top = clip.frame.top ?? FRAME_STYLE.top, bottom = clip.frame.bottom ?? FRAME_STYLE.bottom;
+  return { y: Math.round(OUT_H * top), h: Math.round(OUT_H * (1 - top - bottom)) };
+}
+
 export function regionsFor(seg, clip, has) {
+  const rs = regionsFull(seg, clip, has);
+  if (!frameOn(clip)) return rs;
+  // squeeze every region vertically into the content box (crops adapt, nothing is stretched)
+  const box = contentBox(clip), k = box.h / OUT_H;
+  return rs.map((r) => ({ ...r, R: { ...r.R, y: Math.round(box.y + r.R.y * k), h: Math.round(r.R.h * k) } }));
+}
+
+function regionsFull(seg, clip, has) {
   const W = OUT_W, H = OUT_H;
   let layout = seg.layout;
   if (layout === "cutout") {
@@ -163,7 +182,7 @@ export function segmentAt(clip, t) {
 }
 
 function segEnd(clip, i) {
-  return i + 1 < clip.segments.length ? clip.segments[i + 1].t : clip.end - clip.start;
+  return i + 1 < clip.segments.length ? clip.segments[i + 1].t : clipDur(clip);
 }
 
 function motionTarget(seg) {
@@ -252,7 +271,50 @@ export function transitionInfo(clip, t) {
 }
 
 // Main entry: draw ops at time t. dims = {spk: {w,h}, pres: {w,h}} (true source sizes)
+// Spotlight + click on the slide element the speaker is talking about (clip.spotlights, edit time).
+// box / click are in slide coordinates (0..1 of the presentation video).
+export const SPOT_MODES = { both: "Spotlight + click", spot: "Spotlight only", click: "Click only" };
+function spotOps(clip, t, dims) {
+  if (!dims.pres || clip.spotOn === false || !clip.spotlights?.length) return [];
+  const fade = 0.3;
+  const e = clip.spotlights.find((x) => x.on !== false && t >= x.t0 - fade && t <= x.t1 + fade);
+  if (!e || transitionInfo(clip, t)) return [];
+  const rs = segState(clip, segmentAt(clip, t), t, dims, { spk: !!dims.spk, pres: !!dims.pres }).find((r) => r.src === "pres" && !r.card);
+  if (!rs) return [];
+  const [cx, cy, cw, ch] = rs.pl.c, [dx, dy, dw, dh] = rs.pl.d;
+  const map = (x, y) => [dx + (x * rs.dim.w - cx) * dw / cw, dy + (y * rs.dim.h - cy) * dh / ch];
+  const vx0 = Math.max(rs.R.x, dx), vy0 = Math.max(rs.R.y, dy);
+  const vx1 = Math.min(rs.R.x + rs.R.w, dx + dw), vy1 = Math.min(rs.R.y + rs.R.h, dy + dh);
+  let [x0, y0] = map(e.box[0], e.box[1]);
+  let [x1, y1] = map(e.box[0] + e.box[2], e.box[1] + e.box[3]);
+  x0 = clamp(x0, vx0, vx1); x1 = clamp(x1, vx0, vx1); y0 = clamp(y0, vy0, vy1); y1 = clamp(y1, vy0, vy1);
+  if (x1 - x0 < 8 || y1 - y0 < 8) return [];      // the element is not in view (zoomed elsewhere)
+  const a = clamp(Math.min((t - (e.t0 - fade)) / fade, (e.t1 + fade - t) / fade), 0, 1);
+  const mode = clip.spotMode || "both";
+  const ops = [];
+  if (mode !== "click") ops.push({ spot: nd([x0, y0, x1 - x0, y1 - y0]), d: nd([vx0, vy0, vx1 - vx0, vy1 - vy0]), a, dim: 0.5 });
+  if (mode !== "spot" && e.click) {
+    const k = (t - e.t0) / 0.7;                     // the click ring: grows and fades in 0.7 s
+    if (k >= 0 && k <= 1) {
+      const [px, py] = map(e.click[0], e.click[1]);
+      ops.push({ ring: [px / W, py / H], rad: 0.022 + 0.045 * ease(k), d: [0, 0, 0, 0], a: 1 - k * k * k });
+    }
+  }
+  return ops;
+}
+
 export function opsAt(clip, t, dims) {
+  const ops = [...opsCore(clip, t, dims), ...spotOps(clip, t, dims)];
+  if (!frameOn(clip)) return ops;
+  // header & safe-zone style: a blurred, darkened copy of the room camera fills the whole frame behind
+  const src = dims.spk ? "spk" : dims.pres ? "pres" : null;
+  if (!src) return ops;
+  const d = dims[src];
+  const pl = place({ x: 0, y: 0, w: W, h: H }, d.w, d.h, { fit: "fill", zoom: 1, x: 0.5, y: 0.5 });
+  return [{ s: src, c: nc(pl.c, d), d: nd(pl.d), a: 1, b: 1 }, ...ops];
+}
+
+function opsCore(clip, t, dims) {
   const has = { spk: !!dims.spk, pres: !!dims.pres };
   const tr = transitionInfo(clip, t);
   if (!tr) return segState(clip, segmentAt(clip, t), t, dims, has).flatMap((rs) => regionOps(rs));
@@ -341,12 +403,13 @@ export function newSegment(t, layout = "split", split = 0.5) {
 // Suggest layout changes from detected slide changes: show the new slide full screen
 // for a few seconds, then return to split screen. Conservative on purpose.
 export function autoLayoutFromSlides(clip, slideTimes, opts = {}) {
-  const dur = clip.end - clip.start;
+  const dur = clipDur(clip);
   const hold = opts.hold ?? 3.5;
   const segs = [newSegment(0, "split")];
   let lastEnd = -10;
   for (const ts of slideTimes) {
-    const t = ts - clip.start;
+    if (ts < clip.start || ts > clip.end) continue;
+    const t = toEdit(clip, ts - clip.start);
     if (t < 1.5 || t > dur - 2.5 || t < lastEnd + 3) continue;
     segs.push({ ...newSegment(Math.round(t * 10) / 10, "pres"), motion: "none" });
     const back = Math.min(dur - 0.5, t + hold);
@@ -361,6 +424,8 @@ export function round4(ops) {
   return ops.map((o) => {
     const q = { d: o.d.map(r), a: Math.round((o.a ?? 1) * 1000) / 1000 };
     if (o.fill) q.fill = o.fill;
+    else if (o.spot) { q.spot = o.spot.map(r); q.dim = o.dim; }
+    else if (o.ring) { q.ring = o.ring.map(r); q.rad = r(o.rad); }
     else { q.s = o.s; q.c = o.c.map(r); if (o.r) q.r = o.r.map(r); if (o.b) q.b = 1; if (o.m) q.m = o.m; }
     return q;
   });
@@ -379,10 +444,9 @@ const EMPHASIS = /\b(never|always|biggest|most|secret|mistake|important|key|trut
 
 export function autoEdit(clip, { slides = [], words = [], has = { spk: true, pres: true }, preset = "dynamic" } = {}) {
   const P = AUTO_PRESETS[preset] || AUTO_PRESETS.dynamic;
-  const D = clip.end - clip.start;
+  const D = clipDur(clip);
   const rnd = (i) => { const x = Math.sin(i * 12.9898 + D * 78.233) * 43758.5453; return x - Math.floor(x); };
-  const ws = words.filter((w) => w.end > clip.start && w.start < clip.end)
-    .map((w) => ({ text: w.text, s: w.start - clip.start, e: w.end - clip.start }));
+  const ws = editWords(clip, words).map((w) => ({ text: w.text, s: w.start, e: w.end }));
   // natural cut points = pauses between words / sentence ends
   const pauses = [];
   for (let i = 1; i < ws.length; i++) {
@@ -399,7 +463,8 @@ export function autoEdit(clip, { slides = [], words = [], has = { spk: true, pre
   if (has.pres) {
     // a burst of slide changes (animations, quick clicks) becomes one longer full-screen moment
     for (const st of slides) {
-      const t = st - clip.start;
+      if (st < clip.start || st > clip.end) continue;
+      const t = toEdit(clip, st - clip.start);
       if (t <= 1.5 || t >= D - 2.5) continue;
       const last = events[events.length - 1];
       if (last && t - (last.t + last.hold) < 2) last.hold = Math.min(7, t - last.t + 3);
@@ -477,7 +542,7 @@ export function autoEdit(clip, { slides = [], words = [], has = { spk: true, pre
 // Illustration card visible at time t: {card, rect (output px), a (0..1 entrance/exit)} or null
 export function visualAt(clip, t, dims) {
   const has = { spk: !!dims.spk, pres: !!dims.pres };
-  const D = clip.end - clip.start;
+  const D = clipDur(clip);
   const tr = clip.transition || { type: "smooth", dur: 0.4 };
   const d = tr.type === "cut" ? 0 : clamp(tr.dur || 0.4, 0.1, 1.5);
   for (let i = 0; i < clip.segments.length; i++) {
@@ -500,7 +565,7 @@ export function visualAt(clip, t, dims) {
 
 // Replace [a, b) of the timeline with a new part; what was showing at b continues afterwards.
 export function insertPart(clip, a, b, part) {
-  const D = clip.end - clip.start;
+  const D = clipDur(clip);
   a = clamp(a, 0, D); b = clamp(b, a + 0.5, D);
   const atB = clip.segments[segmentAt(clip, b)];
   const out = clip.segments.filter((s) => s.t < a - 0.05 || s.t > b + 0.05);

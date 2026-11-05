@@ -1,9 +1,10 @@
 // Clip edit state: creation from a candidate, subtitle building, and export plan generation.
 import { TEMPLATES, DEFAULT_HOOK, DEFAULT_EMPHASIS, groupWords, changePoints, renderAt } from "./captions.js";
 import { defaultFraming, newSegment, opsAt, round4, autoEdit, mediaKey, assetOf, cutoutFor, usesCutout, OUT_W, OUT_H } from "./compose.js";
-import { drawOverlay } from "./player.js";
+import { drawOverlay, ensureHeader } from "./player.js";
 import { ensureCardFonts } from "./visuals.js";
 import { api } from "./api.js";
+import { clipDur, editWords, keepRanges, hasCuts } from "./cuts.js";
 
 export function dimsOf(project, clip) {
   const d = {};
@@ -20,11 +21,13 @@ export function dimsOf(project, clip) {
   return d;
 }
 
-export function buildCaptions(words, start, end, maxWords) {
-  const dur = end - start;
-  const ws = (words || [])
-    .filter((w) => w.end > start + 0.05 && w.start < end - 0.05)
-    .map((w) => ({ text: w.text, start: Math.max(0, +(w.start - start).toFixed(3)), end: Math.min(dur, +(w.end - start).toFixed(3)) }));
+export function buildCaptions(words, start, end, maxWords, clip = null) {
+  // with a clip that has removed parts, words are placed on its shortened timeline
+  const c0 = clip || { start, end };
+  const dur = clipDur(c0);
+  const ws = editWords(c0, words)
+    .filter((w) => w.end > 0.05 && w.start < dur - 0.05)
+    .map((w) => ({ text: w.text, start: Math.max(0, +w.start.toFixed(3)), end: Math.min(dur, +w.end.toFixed(3)) }));
   const caps = groupWords(ws, maxWords || 4);
   caps.forEach((c) => { c.end = Math.min(c.end, dur); });
   return caps.filter((c) => c.end - c.start > 0.05);
@@ -80,6 +83,8 @@ export async function ensureFonts(clip) {
   if (clip.hook?.enabled) fams.push([clip.hook.weight, clip.hook.font]);
   await Promise.all(fams.map(([w, f]) => document.fonts.load(`${w} 40px "${f}"`).catch(() => {})));
   await ensureCardFonts();
+  await ensureHeader(clip);
+  if (clip.header?.on) await document.fonts.load(`400 40px "${clip.header.font || "DM Serif Display"}"`).catch(() => {});
   await document.fonts.ready;
 }
 
@@ -115,7 +120,7 @@ export async function buildRenderRequest(clip, project, quality, onProgress) {
   if (usesCutout(clip) && !cut) throw new Error("This clip uses the person cutout, but it isn't prepared yet (or the clip timing changed). In Layout & cropping, select a cutout part and click “Prepare person cutout”.");
   await ensureFonts(clip);
   const fps = clip.fps || 30;
-  const dur = clip.end - clip.start;
+  const dur = clipDur(clip);
   const n = Math.round(dur * fps);
   const dims = dimsOf(project, clip);
   const frames = new Array(n);
@@ -142,7 +147,7 @@ export async function buildRenderRequest(clip, project, quality, onProgress) {
     blobs.push(blob);
   }
   const spec = {
-    name: clip.name, start: clip.start, end: clip.end, fps, width: OUT_W, height: OUT_H, quality, frames, overlays,
+    name: clip.name, start: clip.start, end: clip.end, keep: hasCuts(clip) ? keepRanges(clip) : null, fps, width: OUT_W, height: OUT_H, quality, frames, overlays,
     background: clip.background?.type === "color" ? clip.background.color : "#000000",
     audio: clip.audio,
     // assets used: video time at clip t=0 is (start point - part start)

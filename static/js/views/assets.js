@@ -4,6 +4,7 @@ import { api } from "../api.js";
 import { h, toast, fmtTime, fmtBytes, fmtDur, modal, confirmBox, progressBar } from "../ui.js";
 import { insertPart, segmentAt } from "../compose.js";
 import { sentencesIn, staticStretches } from "./suggest.js";
+import { clipDur } from "../cuts.js";
 
 const STOP = new Set(("a an the and or but of to in on at for with from by as is are was were be this that these those it its " +
   "my our your their img image photo picture video clip final copy new v1 v2 jpg jpeg png mov mp4 screenshot screen shot " +
@@ -133,7 +134,7 @@ function assetTerms(a) {
 export function planAssets(ctx, clip, stretches) {
   const p = ctx.state.project;
   const assets = p.assets || [];
-  const dur = clip.end - clip.start;
+  const dur = clipDur(clip);
   const words = ctx.state.transcript?.words || [];
   const sents = sentencesIn(words, clip);
   const used = clip.segments.filter((s) => s.layout === "media" || s.layout === "visual").map((s, i, arr) => {

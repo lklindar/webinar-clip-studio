@@ -37,6 +37,11 @@ export const TEMPLATES = [
     textColor: "#FFFFFF", upcomingColor: "#A3A3A3", stripPunct: true,
     box: "line", boxColor: "#000000", boxOpacity: 0.55, boxRadius: 0,
     posY: 0.76, maxWords: 6, maxLines: 2, maxWidthPct: 0.7, balance: true, lineHeight: 1.22 },
+  { id: "oneword", name: "One Word + Keyword", note: "Like your boss's video: one big word at a time, key words in orange",
+    ...base, font: "Inter", weight: 800, sizePct: 7.2, letterSpacing: -0.01,
+    textColor: "#FFFFFF", accentColor: "#F5A524", keywordsOn: true, keywords: "AI",
+    shadow: 0.45, shadowColor: "#000000",
+    posY: 0.565, maxWords: 1, maxLines: 1, maxWidthPct: 0.9, anim: "pop", stripPunct: true },
   { id: "yellow", name: "Yellow Pop", note: "Inspired by your Minecraft reference: 1–3 yellow words that pop in",
     ...base, font: "Arimo", weight: 700, sizePct: 6.2, letterSpacing: -0.03,
     textColor: "#F1F23C", outlineWidth: 0.07, outlineColor: "#1C1C1C",
@@ -80,6 +85,15 @@ export const DEFAULT_HOOK = {
 };
 
 // ---- Helpers -------------------------------------------------------------
+const kwCache = new Map();
+export function isKeyword(text, s) {
+  const w = String(text || "").replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+  if (!w) return false;
+  if (s.keywordsAuto !== false && (/^[A-Z]{2,}s?$/.test(w) || /\d/.test(w))) return true;   // AI, COO, 40%, 2026
+  const list = s.keywords || "";
+  if (!kwCache.has(list)) kwCache.set(list, new Set(list.split(/[,;\n]/).map((x) => x.trim().toLowerCase()).filter(Boolean)));
+  return kwCache.get(list).has(w.toLowerCase());
+}
 function rgba(hex, a = 1) {
   const h = hex.replace("#", "");
   const n = parseInt(h.length === 3 ? h.split("").map((c) => c + c).join("") : h, 16);
@@ -299,13 +313,18 @@ export function renderAt(ctx, W, H, t, project) {
 
   const anim = animState(s.anim, t - cap.start);
   const a = Math.max(0, active);
-  const colorFor = (i) => {
+  const colorFor0 = (i) => {
     switch (s.karaoke) {
       case "reveal": return i <= a ? s.textColor : s.upcomingColor;
       case "highlight": return i === a && !s.activeBg ? s.accentColor : s.textColor;
       case "build": return i <= a ? s.textColor : null;
       default: return s.textColor;
     }
+  };
+  // keyword colouring: listed words (and acronyms / numbers) in the accent colour
+  const colorFor = (i) => {
+    const c0 = colorFor0(i);
+    return c0 && s.keywordsOn && isKeyword(cap.words[i]?.text, s) ? s.accentColor : c0;
   };
   drawBlock(ctx, W, H, cap.words, s, {
     colorFor, anim, activeIndex: s.karaoke === "highlight" ? a : null,

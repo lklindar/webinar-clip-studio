@@ -86,6 +86,35 @@ class SourceReader:
             self.proc.kill()
 
 
+class CutReader:
+    """Wraps a SourceReader so only the kept parts are shown: idx[i] = source frame number for output frame i."""
+
+    def __init__(self, reader, idx):
+        self.r, self.idx, self.k, self.cur = reader, idx, 0, None
+
+    def next(self):
+        j = self.idx[min(self.k, len(self.idx) - 1)]
+        self.k += 1
+        while self.cur is None or self.r.i < j + 1:
+            self.cur = self.r.next()
+        return self.cur
+
+    def close(self):
+        self.r.close()
+
+
+def keep_index(keep, n, fps):
+    """Source frame number (from the clip start) for each of the n output frames."""
+    out, acc, k = [], 0.0, 0
+    for i in range(n):
+        t = i / fps
+        while k < len(keep) - 1 and t >= acc + (keep[k][1] - keep[k][0]) - 1e-9:
+            acc += keep[k][1] - keep[k][0]
+            k += 1
+        out.append(int(round((keep[k][0] + (t - acc)) * fps)))
+    return out
+
+
 class ImageReader:
     """A still image used as a source (your asset): the same frame every time."""
 
@@ -200,6 +229,48 @@ def fill_rect(canvas, op, W, H):
         roi[:] = (roi.astype(np.float32) * (1 - a) + col * a).astype(np.uint8)
 
 
+def draw_spot(canvas, op, W, H):
+    """Soften + dim the visible slide area except the spotlighted element (same look as the preview)."""
+    x, y, w, h = op["d"]
+    x0, y0 = max(0, int(round(x * W))), max(0, int(round(y * H)))
+    x1, y1 = min(W, int(round((x + w) * W))), min(H, int(round((y + h) * H)))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return
+    a = float(op.get("a", 1))
+    roi = canvas[y0:y1, x0:x1]
+    orig = roi.astype(np.float32)
+    eff = cv2.GaussianBlur(roi, (0, 0), sigmaX=max(1.0, W * 0.004)).astype(np.float32) * (1 - float(op.get("dim", 0.5)))
+    out = orig * (1 - a) + eff * a
+    sx, sy, sw, sh = op["spot"]
+    sx0, sy0 = max(x0, int(round(sx * W))), max(y0, int(round(sy * H)))
+    sx1, sy1 = min(x1, int(round((sx + sw) * W))), min(y1, int(round((sy + sh) * H)))
+    if sx1 > sx0 and sy1 > sy0:
+        out[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = orig[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0]
+    roi[:] = np.clip(out, 0, 255).astype(np.uint8)
+    if sx1 > sx0 and sy1 > sy0:
+        lay = canvas.copy()
+        cv2.rectangle(lay, (sx0, sy0), (sx1 - 1, sy1 - 1), (255, 255, 255), max(1, int(round(W * 0.003))), cv2.LINE_AA)
+        cv2.addWeighted(lay, 0.9 * a, canvas, 1 - 0.9 * a, 0, dst=canvas)
+
+
+def draw_ring(canvas, op, W, H):
+    a = float(op.get("a", 1))
+    if a <= 0.01:
+        return
+    cx, cy = int(round(op["ring"][0] * W)), int(round(op["ring"][1] * H))
+    r = max(2, int(round(float(op["rad"]) * W)))
+    x0, y0, x1, y1 = max(0, cx - r - 8), max(0, cy - r - 8), min(W, cx + r + 8), min(H, cy + r + 8)
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = canvas[y0:y1, x0:x1]
+    fill = roi.copy()
+    cv2.circle(fill, (cx - x0, cy - y0), r, (36, 165, 245), -1, cv2.LINE_AA)       # orange (BGR)
+    roi[:] = cv2.addWeighted(fill, 0.5 * a, roi, 1 - 0.5 * a, 0)
+    ring = roi.copy()
+    cv2.circle(ring, (cx - x0, cy - y0), r, (255, 255, 255), max(2, int(round(W * 0.009))), cv2.LINE_AA)
+    roi[:] = cv2.addWeighted(ring, a, roi, 1 - a, 0)
+
+
 class Overlays:
     def __init__(self, items, W, H):
         self.items = sorted(items, key=lambda x: x["start"])
@@ -237,17 +308,54 @@ class Overlays:
         roi[:] = np.clip(roi.astype(np.float32) * inv + rgb_a, 0, 255).astype(np.uint8)
 
 
-def audio_args(audio, duration):
-    """Returns (input args, filter string) for the clip's audio."""
+def audio_args(audio, duration, keep=None):
+    """Returns (input args, filter_complex string ending in [aout]) for the clip's audio."""
     if not audio or not audio.get("path"):
-        return ["-f", "lavfi", "-t", f"{duration:.3f}", "-i", "anullsrc=r=48000:cl=stereo"], "anull"
+        return ["-f", "lavfi", "-t", f"{duration:.3f}", "-i", "anullsrc=r=48000:cl=stereo"], "[1:a]anull[aout]"
     start = float(audio["start"])
     filters = []
+    head = "[1:a]"
+    if keep:
+        # play only the kept parts, with a 10 ms fade at each join so the cuts don't click
+        span = keep[-1][1]
+        parts, lead = [], 0.0
+        for a, b in keep:
+            a2, b2 = a + min(start, 0), b + min(start, 0)   # times in the (possibly later-starting) audio file
+            if b2 <= 0:
+                lead += b - a
+                continue
+            if a2 < 0:
+                lead += -a2
+                a2 = 0.0
+            parts.append((a2, b2))
+        n = len(parts)
+        chains = [f"[1:a]asplit={n}" + "".join(f"[s{i}]" for i in range(n))] if n > 1 else []
+        segs = []
+        for i, (a2, b2) in enumerate(parts):
+            src = f"[s{i}]" if n > 1 else "[1:a]"
+            d = b2 - a2
+            fd = min(0.01, d / 4)
+            chains.append(f"{src}atrim=start={a2:.4f}:end={b2:.4f},asetpts=PTS-STARTPTS,"
+                          f"afade=t=in:d={fd:.4f},afade=t=out:st={max(0, d - fd):.4f}:d={fd:.4f}[c{i}]")
+            segs.append(f"[c{i}]")
+        chains.append("".join(segs) + f"concat=n={n}:v=0:a=1[cut]")
+        if lead > 0:
+            filters.append(f"adelay={int(lead * 1000)}:all=1")
+        pre = ";".join(chains) + ";"
+        head = "[cut]"
+        a_start = max(0.0, start)
+        inputs = ["-ss", f"{a_start:.3f}", "-t", f"{max(0.1, span + min(start, 0)):.3f}", "-i", str(audio["path"])]
+        return inputs, pre + head + ",".join(_audio_tail(filters, audio, duration)) + "[aout]"
     if start < 0:
         filters.append(f"adelay={int(-start * 1000)}:all=1")
         dur_in, start = duration + start, 0.0
     else:
         dur_in = duration
+    return (["-ss", f"{start:.3f}", "-t", f"{max(0.1, dur_in):.3f}", "-i", str(audio["path"])],
+            head + ",".join(_audio_tail(filters, audio, duration)) + "[aout]")
+
+
+def _audio_tail(filters, audio, duration):
     gain = float(audio.get("gain_db", 0))
     if gain:
         filters.append(f"volume={gain}dB")
@@ -259,7 +367,7 @@ def audio_args(audio, duration):
     if fade > 0:
         filters.append(f"afade=t=in:st=0:d={fade}")
         filters.append(f"afade=t=out:st={max(0, duration - fade * 2):.3f}:d={fade * 2:.3f}")
-    return ["-ss", f"{start:.3f}", "-t", f"{max(0.1, dur_in):.3f}", "-i", str(audio["path"])], ",".join(filters)
+    return filters
 
 
 def verify(out: Path, W, H, duration) -> dict:
@@ -307,21 +415,28 @@ def main():
     tmp = out.with_name(out.stem + ".part.mp4")
     max_h = int(plan.get("decode_max_height", 1440))
     used = {op["s"] for ops in frames for op in ops if "s" in op} | {op["m"] for ops in frames for op in ops if op.get("m")}
+    keep = plan.get("keep")
+    idx = keep_index(keep, n, fps) if keep else None
     readers = {}
     for key, src in plan["sources"].items():
         if key in used and src.get("image"):
             readers[key] = ImageReader(src["path"], max_h)
+        elif key in used and idx and key in ("spk", "pres", "cutmask"):
+            # the recordings skip the removed silences; your own assets play on uninterrupted
+            r = SourceReader(src["path"], float(src["start"]), keep[-1][1] + 1 / fps, fps, int(src["width"]),
+                             int(src["height"]), max_h, gray=bool(src.get("gray")))
+            readers[key] = CutReader(r, idx)
         elif key in used:
             readers[key] = SourceReader(src["path"], float(src["start"]), duration, fps, int(src["width"]),
                                         int(src["height"]), max_h, gray=bool(src.get("gray")), loop=bool(src.get("loop")))
     overlays = Overlays(plan.get("overlays", []), W, H)
-    a_in, a_filter = audio_args(plan.get("audio"), duration)
+    a_in, a_filter = audio_args(plan.get("audio"), duration, keep)
     q = plan.get("quality", "standard")
     preset, crf = {"preview": ("ultrafast", "28"), "standard": ("veryfast", "20"), "high": ("medium", "18")}[q]
     enc_log = out.with_suffix(".log")
     enc = subprocess.Popen(
         ["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}",
-         "-r", f"{fps}", "-i", "-", *a_in, "-map", "0:v", "-map", "1:a", "-af", a_filter,
+         "-r", f"{fps}", "-i", "-", *a_in, "-filter_complex", a_filter, "-map", "0:v", "-map", "[aout]",
          "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", "-profile:v", "high",
          "-r", f"{fps}", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-t", f"{duration:.3f}",
          "-movflags", "+faststart", str(tmp)],
@@ -338,6 +453,12 @@ def main():
             for op in frames[i]:
                 if "fill" in op:
                     fill_rect(canvas, op, W, H)
+                    continue
+                if "spot" in op:
+                    draw_spot(canvas, op, W, H)
+                    continue
+                if "ring" in op:
+                    draw_ring(canvas, op, W, H)
                     continue
                 f = src_frames.get(op["s"])
                 if f is not None:

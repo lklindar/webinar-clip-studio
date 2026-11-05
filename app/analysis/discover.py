@@ -68,7 +68,8 @@ def run(job, pid: str, params: dict):
     # ---- cache: same transcript + provider + settings -> reuse results (not for "more")
     key = hashlib.sha1(json.dumps([p["transcript"]["fp"], p["transcript"]["model"], p["sync"]["offset"]
                                    if p["transcript"]["audio_role"] == "presentation" else 0,
-                                   provider, model, min_dur, max_dur, count]).encode()).hexdigest()[:16]
+                                   provider, model, min_dur, max_dur, count, "en",
+                                   "v2"]).encode()).hexdigest()[:16]
     cache_file = store.project_dir(pid) / f"analysis_{key}.json"
     if not more and cache_file.exists():
         found = json.loads(cache_file.read_text())
@@ -90,6 +91,19 @@ def run(job, pid: str, params: dict):
         found = heuristic.find_candidates(sents, words, min_dur, max_dur, count, exclude)
         for c in found:
             c["source"] = "heuristic"
+    elif provider == "anthropic" and llm.estimate(sents, model, 1)["input_tokens"] < 600_000:
+        # like asking Gemini about the whole video: one request, global ranking, rich fields
+        avoid_ids = [(c["start_id"], c["end_id"]) for c in existing if "start_id" in c]
+        prompt = llm.build_global_prompt(sents, min_dur, max_dur, count, avoid_ids, slide_marks,
+                                         "en")
+        job.set(0.15, f"Claude is reading the whole webinar ({model})… this takes about a minute")
+        out, usage_total = llm.call_anthropic_rich(prompt, model)
+        found = []
+        for rank, c in enumerate(out.get("candidates", [])):
+            v = validate_rich(c, sents, min_dur, max_dur, rank)
+            if v:
+                v["source"] = f"anthropic:{model}"
+                found.append(v)
     elif provider in ("anthropic", "local"):
         found = []
         total = sents[-1]["end"]
@@ -123,11 +137,14 @@ def run(job, pid: str, params: dict):
                 if v:
                     v["source"] = f"{provider}:{model}"
                     found.append(v)
+    elif provider == "chat":
+        raise UserError("“Your AI chat” works by copy & paste: in step 3, copy the request, paste it into your AI chat, "
+                        "then paste the answer back.")
     else:
         raise UserError(f"Unknown AI provider '{provider}'")
 
     # ---- merge: best first, drop duplicates/overlaps (also with already-shown candidates)
-    found.sort(key=lambda c: -c["score"])
+    found.sort(key=lambda c: (-c["score"], c.get("rank", 0)))
     kept = []
     for c in found:
         a, b = sents[c["start_id"]]["start"], sents[c["end_id"]]["end"]
@@ -163,17 +180,160 @@ def _validate(c, sents, sel_a, sel_b, ctx_b, min_dur, max_dur):
         "why": str(c.get("why", ""))[:600],
         "scores": sc, "score": heuristic.total_score(sc),
         "confidence": c.get("confidence") if c.get("confidence") in ("low", "medium", "high") else "low",
-        "caveats": [str(x)[:200] for x in (c.get("caveats") or [])][:5],
+        "caveats": ([len_note] if len_note else []) + [str(x)[:200] for x in (c.get("caveats") or [])][:5],
     }
 
 
-def _store_candidates(pid, found, sents, words, provider, model, replace, cached):
+VIRAL_BONUS = {"very_high": 8, "high": 4, "medium": 0}
+PAD = 0.4   # breathing room added around a clip when it is stored (0.15 s before + 0.25 s after)
+
+
+def fit_range(sents, a, b, ka, kb, min_dur, max_dur):
+    """Adjust a sentence range (whole sentences only) so the final clip is min_dur..max_dur long.
+    Keeps the key sentence(s); stays inside the AI's chosen range when shortening and grows into
+    the neighbouring sentences when lengthening."""
+    lo, hi = min_dur, max_dur - PAD
+    dur = lambda i, j: sents[j]["end"] - sents[i]["start"]
+    if lo <= dur(a, b) <= hi:
+        return a, b
+    n = len(sents)
+    i, j = ka, kb
+    while j > i and dur(i, j) > hi:          # the key part alone is too long: keep its beginning
+        j -= 1
+    inside = dur(a, b) > hi                  # shortening: only use sentences the AI picked
+    left_lim, right_lim = (a, b) if inside else (0, n - 1)
+    while True:
+        opts = []
+        if j + 1 <= right_lim and dur(i, j + 1) <= hi:
+            opts.append((i, j + 1))
+        if i - 1 >= left_lim and dur(i - 1, j) <= hi:
+            opts.append((i - 1, j))
+        if not opts or (not inside and dur(i, j) >= lo):
+            break
+        # prefer the side that stays inside the AI's range, then continuing forward
+        opts.sort(key=lambda r: (not (a <= r[0] and r[1] <= b), r[0] != i))
+        i, j = opts[0]
+    return i, j
+
+
+def validate_rich(c, sents, min_dur, max_dur, rank=0, strict_len=True):
+    """Check one rich suggestion (from Claude or a pasted AI-chat answer) against our own transcript."""
+    n = len(sents)
+    try:
+        a, b = int(c["start_id"]), int(c["end_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (0 <= a <= b < n):
+        return None
+    try:
+        ka, kb = int(c.get("key_start_id", a)), int(c.get("key_end_id", c.get("key_start_id", a)))
+    except (TypeError, ValueError):
+        ka, kb = a, a
+    ka, kb = max(a, min(ka, b)), max(a, min(max(kb, ka), b))
+    orig = sents[b]["end"] - sents[a]["start"] + PAD
+    a, b = fit_range(sents, a, b, ka, kb, min_dur, max_dur)
+    ka, kb = max(a, min(ka, b)), max(a, min(kb, b))
+    new = sents[b]["end"] - sents[a]["start"] + PAD
+    len_note = None
+    if not (min_dur - 0.5 <= new <= max_dur + 0.5):
+        len_note = (f"{round(new)} s — couldn't fit {int(min_dur)}–{int(max_dur)} s with whole sentences here. "
+                    "Adjust Start/End below.")
+    elif abs(new - orig) > 1:
+        len_note = f"Length adjusted from {round(orig)} s to {round(new)} s to fit {int(min_dur)}–{int(max_dur)} s."
+    sc = {k: int(max(1, min(10, int((c.get("scores") or {}).get(k, 6))))) for k in heuristic.WEIGHTS}
+    viral = c.get("viral") if c.get("viral") in VIRAL_BONUS else "medium"
+    tips = c.get("editing_tips") or []
+    if isinstance(tips, str):
+        tips = [tips]
+    return {
+        "start_id": a, "end_id": b, "key_start_id": ka, "key_end_id": kb, "rank": rank,
+        "title": str(c.get("title", ""))[:90], "topic": str(c.get("topic", "") or c.get("title", ""))[:60] or "general",
+        "viral": viral, "hook": str(c.get("hook", ""))[:120], "hook_kind": "ai_suggested",
+        "caption": str(c.get("caption", ""))[:300], "why": str(c.get("why", ""))[:700],
+        "tips": [str(x)[:200] for x in tips][:4],
+        "scores": sc, "score": min(100, heuristic.total_score(sc) + VIRAL_BONUS[viral]),
+        "confidence": c.get("confidence") if c.get("confidence") in ("low", "medium", "high") else "medium",
+        "caveats": ([len_note] if len_note else []) + [str(x)[:200] for x in (c.get("caveats") or [])][:5],
+    }
+
+
+def _sentences_marks(p, sents):
+    marks = set()
+    for t in slide_changes_master(p):
+        for x in sents:
+            if x["start"] - 0.5 <= t <= x["end"] + 0.5:
+                marks.add(x["id"])
+                break
+    return marks
+
+
+def chat_prompt(pid, params):
+    """The self-contained prompt to paste into Gemini / ChatGPT (whole transcript + answer format)."""
+    p = store.load(pid)
+    words = master_words(p)
+    if not words:
+        raise UserError("There is no transcript yet. Transcribe the webinar first.")
+    sents = build_sentences(words)
+    existing = p["candidates"] if params.get("more") else []
+    avoid = [(c["start_id"], c["end_id"]) for c in existing if "start_id" in c]
+    text = llm.build_global_prompt(sents, float(params.get("min_dur", 30)), float(params.get("max_dur", 180)),
+                                   int(params.get("count", 8)), avoid, _sentences_marks(p, sents),
+                                   "en", for_chat=True)
+    return {"prompt": text, "sentences": len(sents), "chars": len(text)}
+
+
+def import_chat(pid, text, params):
+    """Turn a pasted AI-chat answer into clip suggestions (validated against our own transcript)."""
+    p = store.load(pid)
+    words = master_words(p)
+    if not words:
+        raise UserError("There is no transcript yet. Transcribe the webinar first.")
+    sents = build_sentences(words)
+    data = llm.parse_chat_answer(text)
+    min_dur, max_dur = float(params.get("min_dur", 30)), float(params.get("max_dur", 180))
+    more = bool(params.get("more"))
+    found, skipped = [], 0
+    for rank, c in enumerate(data["candidates"]):
+        v = validate_rich(c, sents, min_dur, max_dur, rank, strict_len=False) if isinstance(c, dict) else None
+        if v:
+            v["source"] = "chat:" + str(params.get("ai_name") or "your AI chat")[:30]
+            found.append(v)
+        else:
+            skipped += 1
+    if not found:
+        raise UserError("None of the suggested clips could be used — the sentence numbers don't fit this "
+                        "transcript or the lengths are far outside the chosen range. Make sure you pasted the "
+                        "answer to the prompt copied from THIS project.")
+    # The user chose what to paste, so keep every valid clip (even overlapping ones);
+    # only skip exact repeats of the same sentence range.
+    existing = {(c.get("start_id"), c.get("end_id")) for c in p["candidates"]
+                if more or c["status"] == "approved"}
+    found.sort(key=lambda c: (-c["score"], c["rank"]))
+    kept, seen = [], set(existing)
+    for c in found:
+        key = (c["start_id"], c["end_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(c)
+    res = _store_candidates(pid, kept, sents, words, "chat", str(params.get("ai_name") or "your AI chat"),
+                            replace=not more, cached=False, dedupe_approved=False)
+    res["skipped"] = skipped + (len(found) - len(kept))
+    res["received"] = len(data["candidates"])
+    return res
+
+
+def _store_candidates(pid, found, sents, words, provider, model, replace, cached, dedupe_approved=True):
     now = time.time()
     new = []
     for c in found:
         a, b = sents[c["start_id"]]["start"], sents[c["end_id"]]["end"]
         start, end = max(0.0, round(a - 0.15, 2)), round(b + 0.25, 2)  # small breathing room
-        new.append({**c, "id": uuid.uuid4().hex[:8], "start": start, "end": end,
+        extra = {}
+        if "key_start_id" in c:   # the "money line" — always the speaker's exact words from our transcript
+            ks, ke = sents[c["key_start_id"]]["start"], sents[c["key_end_id"]]["end"]
+            extra = {"key_text": text_in_range(words, ks - 0.01, ke + 0.01), "key_start": ks, "key_end": ke}
+        new.append({**c, **extra, "id": uuid.uuid4().hex[:8], "start": start, "end": end,
                     "orig_start": start, "orig_end": end, "text": text_in_range(words, start, end),
                     "status": "new", "created": now})
 
@@ -182,7 +342,8 @@ def _store_candidates(pid, found, sents, words, provider, model, replace, cached
             # keep candidates the user already approved; replace the rest
             keep = [c for c in p["candidates"] if c["status"] == "approved"]
             keep_ranges = [(c["start"], c["end"]) for c in keep]
-            fresh = [c for c in new if not any(_overlap(c["start"], c["end"], x, y) for x, y in keep_ranges)]
+            fresh = [c for c in new if not dedupe_approved
+                     or not any(_overlap(c["start"], c["end"], x, y) for x, y in keep_ranges)]
             p["candidates"] = keep + fresh
             added = len(fresh)
         else:

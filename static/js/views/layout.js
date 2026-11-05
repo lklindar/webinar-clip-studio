@@ -1,9 +1,12 @@
 // Step 5: vertical layout, layout changes over time, cropping, motion.
 import { api, watchJob } from "../api.js";
 import { h, toast, fmtTime, parseTime, slider, select, progressBar } from "../ui.js";
+import { TEMPLATES } from "../captions.js";
+import { FRAME_STYLE, frameOn, SPOT_MODES } from "../compose.js";
 import { LAYOUTS, MOTIONS, FRAMING_LABELS, AUTO_PRESETS, ASSET_PLACES, cutoutFor, defaultFraming, regionsFor, segmentAt, newSegment, autoLayoutFromSlides } from "../compose.js";
-import { applyAutoEdit } from "../clipstate.js";
-import { suggestionsPanel, previewCanvas } from "./suggest.js";
+import { applyAutoEdit, buildCaptions } from "../clipstate.js";
+import { clipDur, toEdit, editWords, setKeep, hasCuts, cutPoints } from "../cuts.js";
+import { previewCanvas } from "./suggest.js";
 import { assetsPanel, pickAsset, mediaPart, thumbUrl } from "./assets.js";
 import { cardFromSpeech, CARD_KINDS, CARD_THEMES } from "../visuals.js";
 import { editorShell } from "./editorshell.js";
@@ -29,7 +32,7 @@ export async function render(main, ctx) {
   const has = { spk: !!p.sources.speaker, pres: !!p.sources.presentation };
   let sel = Math.min(ctx.state.layoutSel ?? 0, clip.segments.length - 1);  // selected segment index
   let framingKey = null;    // selected framing region
-  const dur = () => clip.end - clip.start;
+  const dur = () => clipDur(clip);
 
   const tl = h("div", { class: "timeline" });
   const segBox = h("div", { class: "card" });
@@ -69,12 +72,132 @@ export async function render(main, ctx) {
     sel = 0; ed.changed(); drawAll();
   }
   const tr0 = await ctx.transcript();
-  const speechIn = (a, b) => (tr0?.words || []).filter((w) => w.end > clip.start + a && w.start < clip.start + b).map((w) => w.text).join(" ");
-  const suggestBox = suggestionsPanel(ctx, clip, { onApply: (msg) => { changed(); drawAll(); toast(msg + " Press play to watch it.", "ok"); } });
+  const speechIn = (a, b) => editWords(clip, tr0?.words || []).filter((w) => w.end > a && w.start < b).map((w) => w.text).join(" ");
+  // ---------------------------------------------------------------- edit style (Standard / Header & safe zone)
+  const styleBox = h("div", { class: "card", style: { borderColor: "#d6d6fb", background: "#fbfbff" } });
+  const cand = p.candidates.find((c) => c.id === clip.candidateId || c.id === clip.id);
+  const logoKey = `wcs.headerLogo.${p.id}`;
+  const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+  const lsSet = (k, v) => { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch { /* ignore */ } };
+  function applyHeaderStyle() {
+    const snap = JSON.parse(JSON.stringify({ segments: clip.segments, framing: clip.framing, style: clip.style, templateId: clip.templateId,
+      smartPos: clip.smartPos !== false, backdrop: clip.backdrop !== false, captions: clip.captions, captionsEdited: clip.captionsEdited, transition: clip.transition, layoutEdited: clip.layoutEdited }));
+    if (!frameOn(clip)) clip.undoStyle = snap;
+    const top = FRAME_STYLE.top, bottom = FRAME_STYLE.bottom;
+    clip.frame = { on: true, top, bottom };
+    clip.header = { on: true, font: "DM Serif Display", color: "#FFFFFF",
+      title: clip.header?.title ?? (cand?.title || clip.name || ""), logoUrl: clip.header?.logoUrl ?? lsGet(logoKey) ?? "" };
+    // slides full width at their own aspect ratio on top, the room camera below — no layout changes
+    const pd = p.sources.presentation, box = 1 - top - bottom;
+    const slideH = pd ? (1080 * pd.height / pd.width) / 1920 : 0.32;
+    const split = Math.max(0.3, Math.min(0.7, slideH / box));
+    clip.segments = [{ ...newSegment(0, has.pres && has.spk ? "split" : has.pres ? "pres" : "speaker", split), motion: "none" }];
+    clip.splitOrder = "pres-top";
+    clip.layoutEdited = true;
+    // subtitles: one word at a time, key words in orange, on the upper part of the camera picture
+    const tpl = TEMPLATES.find((x) => x.id === "oneword");
+    const camTop = top + box * (has.pres && has.spk ? split : 0), camBot = 1 - bottom;
+    clip.templateId = tpl.id;
+    clip.style = { ...tpl, keywords: clip.style?.keywords && clip.style.keywordsOn ? clip.style.keywords : tpl.keywords,
+      posY: +(camTop + (camBot - camTop) * 0.8).toFixed(3) };   // lower part of the camera: stays off the speaker's face
+    clip.smartPos = false;
+    clip.backdrop = false;          // just a shadow behind the word, no dark box
+    if (!clip.captionsEdited) clip.captions = buildCaptions(tr0?.words || [], clip.start, clip.end, clip.style.maxWords, clip);
+    sel = 0;
+  }
+  function applyStandard() {
+    const u = clip.undoStyle;
+    if (u) Object.assign(clip, u);
+    clip.frame = { ...(clip.frame || {}), on: false };
+    if (clip.header) clip.header.on = false;
+    delete clip.undoStyle;
+    sel = 0;
+  }
+  const drawStyle = () => {
+    styleBox.innerHTML = "";
+    const on = frameOn(clip);
+    const choose = (v) => { if (v === "header" && !on) applyHeaderStyle(); if (v === "standard" && on) applyStandard(); ed.changed(); drawStyle(); drawAll(); };
+    styleBox.append(h("div", { class: "row between" }, h("h3", {}, "🎬 Edit style"),
+      h("div", { class: "seg-ctl" },
+        h("button", { class: on ? "" : "on", onclick: () => choose("standard") }, "Standard"),
+        h("button", { class: on ? "on" : "", onclick: () => choose("header") }, "Header & safe zone"))));
+    if (!on) {
+      styleBox.append(h("p", { class: "small muted" }, "Standard: slides and speaker fill the whole 9:16 frame. ",
+        "“Header & safe zone” = like your boss's video: title and logo on top, slides, the camera below, an empty band at the bottom, and one-word subtitles with key words in orange."));
+      return;
+    }
+    const hd = clip.header;
+    const title = h("input", { type: "text", value: hd.title || "", placeholder: "e.g. 3 AI levels for business owners", style: { width: "100%" } });
+    title.addEventListener("input", () => { hd.title = title.value; ed.changed(false); player.draw(); });
+    title.addEventListener("change", () => ed.changed());
+    const kw = h("input", { type: "text", value: clip.style.keywords || "", placeholder: "AI, ChatGPT, COO", style: { width: "100%" } });
+    kw.addEventListener("change", () => { clip.style.keywords = kw.value; ed.changed(); player.draw(); });
+    const logoImg = hd.logoUrl ? h("img", { src: hd.logoUrl, style: { height: "34px", maxWidth: "120px", objectFit: "contain", background: "#333", borderRadius: "6px", padding: "3px" } }) : null;
+    styleBox.append(
+      h("p", { class: "small muted" }, "Top: title + logo · middle: slides and camera · bottom: left empty for the TikTok / Reels buttons. Subtitles show one word at a time."),
+      h("label", { class: "field" }, h("span", { class: "field-label" }, "Title at the top (stays the whole clip)"), title),
+      h("div", { class: "field" }, h("span", { class: "field-label" }, "Logo"),
+        h("div", { class: "row" }, logoImg,
+          h("button", { class: "btn small", onclick: async () => {
+            const a = await pickAsset(ctx, null);
+            if (!a) return;
+            if (a.kind !== "image") { toast("Choose an image (PNG with a transparent background works best).", "error"); return; }
+            hd.logoUrl = `/api/projects/${p.id}/assets/${a.id}/file`;
+            lsSet(logoKey, hd.logoUrl);
+            ed.changed(); drawStyle(); player.draw();
+          } }, hd.logoUrl ? "Change logo" : "Choose logo…"),
+          hd.logoUrl ? h("button", { class: "btn small ghost", onclick: () => { hd.logoUrl = ""; lsSet(logoKey, ""); ed.changed(); drawStyle(); player.draw(); } }, "Remove") : null,
+          h("span", { class: "small muted" }, "Upload it first under “Your assets” (step 1)."))),
+      h("label", { class: "field" }, h("span", { class: "field-label" }, "Words shown in orange (besides abbreviations like AI and numbers)"), kw));
+  };
+  drawStyle();
+
+  // ---------------------------------------------------------------- spotlight + click on what he talks about
+  const spotBox = h("div", { class: "card" });
+  const drawSpots = () => {
+    spotBox.innerHTML = "";
+    if (!has.pres) { spotBox.style.display = "none"; return; }
+    const list = clip.spotlights || [];
+    const jobBox = h("div");
+    const find = h("button", { class: "btn small primary", onclick: async () => {
+      find.disabled = true;
+      try {
+        const job = await api(`/api/projects/${p.id}/spotlights`, { json: { start: clip.start, end: clip.end } });
+        const done = await watchJob(job.id, (j) => { jobBox.innerHTML = ""; jobBox.append(progressBar(j.progress, j.message || "Reading the slides…")); });
+        jobBox.innerHTML = "";
+        const D = clip.end - clip.start;
+        clip.spotlights = (done.result.events || []).map((e, i) => ({ id: `s${i}`, on: true, text: e.text, said: e.said, box: e.box, click: e.click,
+          t0: +toEdit(clip, Math.max(0, e.start - clip.start)).toFixed(2), t1: +toEdit(clip, Math.min(D, e.end - clip.start)).toFixed(2) }))
+          .filter((e) => e.t1 - e.t0 >= 0.8);
+        if (clip.spotOn === undefined) clip.spotOn = true;
+        ed.changed();
+        toast(clip.spotlights.length ? `Found ${clip.spotlights.length} moment${clip.spotlights.length > 1 ? "s" : ""}. Press play to see it.` : "No slide element clearly matches what he says in this clip.", clip.spotlights.length ? "ok" : "info", 6000);
+      } catch (e) { if (!e.cancelled) toast(e.message, "error"); }
+      drawSpots();
+    } }, list.length ? "Find again" : "Find the important points");
+    spotBox.append(
+      h("div", { class: "row between" }, h("h3", {}, "🔦 Spotlight on what he talks about"),
+        list.length ? h("label", { class: "check", style: { margin: 0 } }, h("input", { type: "checkbox", checked: clip.spotOn !== false,
+          onchange: (e) => { clip.spotOn = e.target.checked; ed.changed(); } }), "On") : null),
+      h("p", { class: "small muted" }, "The app reads the text on the slides and listens to what he says. When he talks about one element (e.g. “AI Chatbot – a knowledgeable intern”), ",
+        "that element stays sharp, the rest of the slide dims, and a click ring pops on it."),
+      h("div", { class: "row" }, find,
+        list.length ? select("Effect", clip.spotMode || "both", Object.entries(SPOT_MODES), (v) => { clip.spotMode = v; ed.changed(); }) : null),
+      jobBox);
+    if (list.length) {
+      spotBox.append(h("div", { style: { marginTop: "8px" } }, list.map((e) => h("div", { class: "row", style: { padding: "5px 0", borderTop: "1px solid var(--line)", flexWrap: "nowrap", alignItems: "flex-start" } },
+        h("input", { type: "checkbox", checked: e.on !== false, title: "Use this moment", onchange: (ev) => { e.on = ev.target.checked; ed.changed(); } }),
+        h("button", { class: "btn small ghost", title: "Watch this moment", onclick: () => { player.seek(Math.max(0, e.t0 - 0.5)); player.play(); } }, `▶ ${fmtTime(e.t0)}–${fmtTime(e.t1)}`),
+        h("div", { style: { flex: "1", minWidth: 0 } }, h("b", { class: "small" }, e.text.slice(0, 60)),
+          h("div", { class: "small muted", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, "“", e.said || "", "”"))))));
+    }
+  };
+  drawSpots();
+
   const assetBox = assetsPanel(ctx, clip, { onApply: (msg) => { changed(); drawAll(); toast(msg + " Press play to watch it.", "ok"); } });
   right.append(
-    autoBox,
-    suggestBox,
+    styleBox,
+    spotBox,
     assetBox,
     h("div", { class: "card" },
       h("div", { class: "row between" }, h("h3", {}, "Layout timeline"),
@@ -123,9 +246,11 @@ export async function render(main, ctx) {
       }
     });
     for (const t of p.slides_master || []) {
-      const r = t - clip.start;
+      if (t <= clip.start || t >= clip.end) continue;
+      const r = toEdit(clip, t - clip.start);
       if (r > 0 && r < D) tl.append(h("div", { class: "tl-slide", style: { left: pct(r) }, title: `Slide change at ${fmtTime(r)}` }));
     }
+    for (const ct of cutPoints(clip)) tl.append(h("div", { class: "tl-slide", style: { left: pct(ct), background: "#ef4444", opacity: 0.55 }, title: `Silence / filler removed here (${fmtTime(ct)})` }));
     for (const c of clip.captions || []) tl.append(h("div", { class: "tl-cap", style: { left: pct(c.start), width: pct(Math.max(0.05, c.end - c.start - 0.03)) } }));
     const ph = h("div", { class: "tl-play", style: { left: pct(player.t) } });
     tl.append(ph);
@@ -215,7 +340,7 @@ export async function render(main, ctx) {
     const box = h("div", { class: "card flat", style: { margin: "10px 0", padding: "12px" } });
     const cut = cutoutFor(ctx.state.project, clip);
     const running = (ctx.state.project.jobs || []).find((j) => j.kind === "cutout" && (j.status === "running" || j.status === "queued"));
-    const dur = clip.end - clip.start;
+    const dur = clipDur(clip);
     if (cut) box.append(h("div", { class: "small", style: { color: "var(--ok)", fontWeight: 600 } }, "✓ Person cutout ready — the speaker's background is replaced by the slides."));
     else if (running) box.append(progressBar(running.progress, running.message || "Cutting out the speaker…"));
     else box.append(h("div", { class: "alert info", style: { marginBottom: 0 } },
@@ -410,6 +535,7 @@ export async function render(main, ctx) {
         const upd = await api(`/api/projects/${p.id}/candidates/${clip.id}`, { method: "PATCH", json: { start: a, end: b } });
         const cand = ctx.state.project.candidates.find((c) => c.id === clip.id);
         if (cand) Object.assign(cand, upd);
+        if (hasCuts(clip)) setKeep(clip, null);
         clip.start = upd.start; clip.end = upd.end;
         clip.needsCaptionRebuild = true;
         ctx.saveClip(clip);
@@ -426,11 +552,12 @@ export async function render(main, ctx) {
         h("span", { class: "muted" }, "to"),
         h("button", { class: "btn small", onclick: () => apply(clip.start, clip.end - 0.5) }, "−0.5 s"), en,
         h("button", { class: "btn small", onclick: () => apply(clip.start, clip.end + 0.5) }, "+0.5 s"),
-        h("span", { class: "chip" }, `${(clip.end - clip.start).toFixed(1)} s`)),
+        h("span", { class: "chip" }, `${(clip.end - clip.start).toFixed(1)} s`),
+        hasCuts(clip) ? h("span", { class: "chip ok" }, `${clipDur(clip).toFixed(1)} s after removing silences`) : null),
       h("p", { class: "small muted" }, "Changing the timing rebuilds automatic subtitles. Layout changes keep their position relative to the clip start."));
   }
 
-  function drawAll() { ctx.state.layoutSel = sel; drawAuto(); drawTimeline(); drawSegment(); drawFraming(); drawLook(); drawTiming(); player.draw(); }
+  function drawAll() { ctx.state.layoutSel = sel; drawTimeline(); drawSegment(); drawFraming(); drawLook(); drawTiming(); player.draw(); }
   drawAll();
   return ed.cleanup;
 }

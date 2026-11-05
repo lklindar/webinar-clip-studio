@@ -41,7 +41,7 @@ def main():
         for k, j in enumerate(jobs):
             transcribe(model, model_name, j["pcm"], j["out"], language,
                        p0=0.05 + 0.95 * done / total, p1=0.05 + 0.95 * (done + sizes[k]) / total,
-                       label=f"Transcribing clip {k + 1} of {len(jobs)}")
+                       label=j.get("label") or f"Transcribing clip {k + 1} of {len(jobs)}", verbatim=bool(j.get("verbatim")))
             done += sizes[k]
         emit(progress=1.0, message=f"Transcribed {len(jobs)} clip(s)", result={"clips": len(jobs)})
         return
@@ -53,14 +53,20 @@ def main():
     transcribe(model, model_name, pcm, out, language)
 
 
-def transcribe(model, model_name, pcm, out, language, p0=0.02, p1=1.0, label=None):
+# A transcript-style prompt full of hesitations makes Whisper write down "um", "uh", "ah"… instead of
+# silently cleaning them up (it normally leaves them out).
+VERBATIM_PROMPT = "Umm, so, uh, let me think, like, hmm... Okay, ah, here's what I'm, uh, thinking. Eh, erm, yeah."
+
+
+def transcribe(model, model_name, pcm, out, language, p0=0.02, p1=1.0, label=None, verbatim=False):
     audio = np.memmap(pcm, dtype=np.float32, mode="r")
     duration = len(audio) / 16000
     emit(progress=p0, message=label or "Listening to the webinar…")
     t0 = time.time()
     segments, info = model.transcribe(
-        np.asarray(audio), language=language, word_timestamps=True, vad_filter=True,
+        np.asarray(audio), language=language, word_timestamps=True, vad_filter=not verbatim,
         beam_size=5, condition_on_previous_text=False,
+        **({"initial_prompt": VERBATIM_PROMPT} if verbatim else {}),
     )
     words, segs = [], []
     for seg in segments:
