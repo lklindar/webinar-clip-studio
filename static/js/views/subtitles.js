@@ -4,6 +4,7 @@ import { TEMPLATES, FONTS, renderAt, retimeWords, rescaleCaption, newId } from "
 import { buildCaptions, toSRT, ensureFonts, dimsOf } from "../clipstate.js";
 import { captionProject } from "../player.js";
 import { editorShell } from "./editorshell.js";
+import { clipDur } from "../cuts.js";
 
 const SAMPLE = [
   { text: "This", start: 0, end: 0.3 }, { text: "one", start: 0.3, end: 0.6 }, { text: "change", start: 0.6, end: 1.0 },
@@ -15,6 +16,9 @@ export async function render(main, ctx) {
     intro: "Subtitles are generated from the transcript. Pick a template, adjust the style, and correct any words or timings." });
   if (!ed) return;
   const { clip, player, right, changed } = ed;
+  let smartBox = null;
+  // dragging the subtitles on the preview switches smart position off: show that here too
+  ed.setOnPosChanged(() => { if (smartBox) smartBox.checked = false; drawBody(); });
   const tr = await ctx.transcript();
   const dims = dimsOf(ctx.state.project, clip);
   let tab = ctx.state.subTab || "style";
@@ -26,7 +30,7 @@ export async function render(main, ctx) {
       h("label", { class: "check", style: { margin: 0 } }, h("input", { type: "checkbox", checked: clip.captionsOn !== false,
         onchange: (e) => { clip.captionsOn = e.target.checked; changed(); } }), "Show subtitles"),
       h("label", { class: "check", style: { margin: 0 }, title: "Places subtitles between slides and speaker, below full-screen slides, and below the face" },
-        h("input", { type: "checkbox", checked: clip.smartPos !== false, onchange: (e) => { clip.smartPos = e.target.checked; changed(); drawBody(); } }),
+        smartBox = h("input", { type: "checkbox", checked: clip.smartPos !== false, onchange: (e) => { clip.smartPos = e.target.checked; changed(); drawBody(); ed.syncPos(); } }),
         "Smart position (avoid slide text and face)"),
       h("label", { class: "check", style: { margin: 0 }, title: "Adds a soft dark band behind subtitles that have no background box, so they stay readable on light slides" },
         h("input", { type: "checkbox", checked: clip.backdrop !== false, onchange: (e) => { clip.backdrop = e.target.checked; changed(); drawTemplates(); } }),
@@ -70,7 +74,7 @@ export async function render(main, ctx) {
   }
 
   function regroup() {
-    clip.captions = buildCaptions(tr?.words || [], clip.start, clip.end, clip.style.maxWords);
+    clip.captions = buildCaptions(tr?.words || [], clip.start, clip.end, clip.style.maxWords, clip);
     clip.captionsKey = ctx.state.project.transcript?.created || null;
   }
 
@@ -149,7 +153,7 @@ export async function render(main, ctx) {
       en.addEventListener("change", () => {
         const v = parseTime(en.value);
         if (isNaN(v) || v <= c.start) { en.value = fmtTime(c.end, 2); toast("End must be after the start.", "error"); return; }
-        rescaleCaption(c, c.start, Math.min(clip.end - clip.start, v)); markEdited(); redraw();
+        rescaleCaption(c, c.start, Math.min(clipDur(clip), v)); markEdited(); redraw();
       });
       tx.addEventListener("change", () => { if (!tx.value.trim()) { caps.splice(i, 1); } else retimeWords(c, tx.value); markEdited(); redraw(); });
       tx.addEventListener("focus", () => player.seek(c.start + 0.01));
@@ -192,7 +196,7 @@ export async function render(main, ctx) {
           regroup(); clip.captionsEdited = false; changed(); redraw();
         } }, "↺ Rebuild from transcript"),
         h("button", { class: "btn small", onclick: () => {
-          const add = { id: newId(), start: player.t, end: Math.min(clip.end - clip.start, player.t + 1.5), words: [], text: "" };
+          const add = { id: newId(), start: player.t, end: Math.min(clipDur(clip), player.t + 1.5), words: [], text: "" };
           retimeWords(add, "New text");
           caps.push(add); caps.sort((a, b) => a.start - b.start); markEdited(); redraw();
         } }, "+ Add subtitle at playhead"),

@@ -740,7 +740,7 @@ async def discover_clips(pid: str, request: Request):
     if model not in WHISPER_MODELS:
         raise HTTPException(400, "Unknown speech model")
     language = body.get("language", s["language"]) or ""
-    params = {k: body[k] for k in ("min_dur", "max_dur", "count", "more", "provider") if k in body}
+    params = {k: body[k] for k in ("min_dur", "max_dur", "count", "more", "provider", "language") if k in body}
     if params.get("provider") == "anthropic" and not get_secret("ANTHROPIC_API_KEY"):
         raise HTTPException(400, "Claude is selected but no API key is configured. Add it in Settings first.")
     only_transcribe = bool(body.get("transcribe_only"))
@@ -765,6 +765,20 @@ async def discover_clips(pid: str, request: Request):
     return manager.submit("discover", pid, "ai", work, label).to_dict()
 
 
+@app.post("/api/projects/{pid}/ai-prompt")
+async def ai_prompt(pid: str, request: Request):
+    """Prompt + whole transcript to paste into your own AI chat (Gemini, ChatGPT, Claude.ai)."""
+    body = await request.json()
+    return discover.chat_prompt(pid, body)
+
+
+@app.post("/api/projects/{pid}/ai-import")
+async def ai_import(pid: str, request: Request):
+    """Read the answer pasted back from the AI chat and turn it into clip suggestions."""
+    body = await request.json()
+    return discover.import_chat(pid, str(body.get("text", "")), body)
+
+
 @app.get("/api/projects/{pid}/transcript")
 def transcript(pid: str):
     p = store.load(pid)
@@ -774,6 +788,126 @@ def transcript(pid: str):
     sents = build_sentences(words)
     return {"words": words, "sentences": [{k: s[k] for k in ("id", "start", "end", "text")} for s in sents],
             "language": p["transcript"].get("language"), "model": p["transcript"]["model"]}
+
+
+# ------------------------------------------------------------------ word-for-word listening (fillers)
+def _verbatim_file(p, start, end, model):
+    role = p["sync"]["audio"]
+    src = p["sources"].get(role) or {}
+    return CACHE / "transcripts" / f"{src.get('fp', 'x')}-{model}-verbatim-{start:.2f}-{end:.2f}.json"
+
+
+def _loudness(pcm_path, t0, hop=0.02):
+    """Loudness (dB) of 16 kHz mono float audio every 20 ms; t0 = master time of the first sample."""
+    import numpy as np
+    a = np.fromfile(str(pcm_path), np.float32)
+    n = int(16000 * hop)
+    k = len(a) // n
+    if k < 1:
+        return {"t0": t0, "hop": hop, "db": []}
+    r = np.sqrt(np.mean(a[:k * n].reshape(k, n) ** 2, axis=1))
+    return {"t0": round(t0, 3), "hop": hop, "db": [round(float(x), 1) for x in 20 * np.log10(r + 1e-6)]}
+
+
+def _clip_pcm(pid, p, start, end, td, pad=0.3):
+    role = p["sync"]["audio"]
+    src = p["sources"][role]
+    off = p["sync"]["offset"] if role == "presentation" else 0.0
+    s0 = max(0.0, start - pad)
+    dur = end + pad - s0
+    pcm = Path(td) / "clip.f32"
+    path, local = keep.resolve(pid, src, s0 + off, s0 + off + dur, role)
+    r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{max(0, local):.3f}", "-t", f"{dur:.3f}",
+                        "-i", path, "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-f", "f32le", str(pcm)],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not pcm.exists() or pcm.stat().st_size == 0:
+        raise UserError("Could not read this clip's audio. " + r.stderr[-200:])
+    return pcm, s0
+
+
+@app.get("/api/projects/{pid}/verbatim")
+def verbatim_get(pid: str, start: float, end: float):
+    import tempfile
+    p = store.load(pid)
+    f = _verbatim_file(p, start, end, load_settings()["whisper_model"])
+    if not f.exists():
+        raise HTTPException(404, "Not listened to yet")
+    data = json.loads(f.read_text())
+    if "energy" not in data:   # saved before loudness was measured
+        with tempfile.TemporaryDirectory(dir=CACHE / "audio") as td:
+            pcm, s0 = _clip_pcm(pid, p, start, end, td)
+            data["energy"] = _loudness(pcm, s0)
+        f.write_text(json.dumps(data))
+    return data
+
+
+@app.post("/api/projects/{pid}/verbatim")
+async def verbatim(pid: str, request: Request):
+    """Listen to one clip again, word for word, so hesitations ("um", "uh", "ah"…) are written down too."""
+    import tempfile
+    body = await request.json()
+    start, end = float(body["start"]), float(body["end"])
+    if not 0 <= start < end or end - start > 600:
+        raise HTTPException(400, "Bad clip range")
+    p = store.load(pid)
+    role = p["sync"]["audio"]
+    src = p["sources"].get(role)
+    if not src or not src.get("has_audio"):
+        raise HTTPException(400, f"The {role} recording has no audio. Choose the other recording as audio source in step 2.")
+    model = load_settings()["whisper_model"]
+    out_f = _verbatim_file(p, start, end, model)
+
+    def work(job):
+        if out_f.exists():
+            return json.loads(out_f.read_text())
+        with tempfile.TemporaryDirectory(dir=CACHE / "audio") as td:
+            job.set(0.02, "Reading the clip's audio…")
+            pcm, s0 = _clip_pcm(pid, p, start, end, td)
+            out = Path(td) / "clip.json"
+            energy = _loudness(pcm, s0)
+            jobs_file = Path(td) / "jobs.json"
+            jobs_file.write_text(json.dumps([{"pcm": str(pcm), "out": str(out), "verbatim": True,
+                                              "label": "Listening for pauses and filler words"}]))
+            lang = p.get("transcript", {}).get("language") or ""
+            job.run_worker([PYTHON, "-m", "app.workers.transcribe", "--batch", str(jobs_file), model, lang], 0.05, 0.98)
+            data = json.loads(out.read_text())
+        words = [{**w, "start": round(w["start"] + s0, 3), "end": round(w["end"] + s0, 3)} for w in data["words"]]
+        words = [w for w in words if w["end"] > start and w["start"] < end]
+        res = {"words": words, "start": start, "end": end, "model": model, "energy": energy}
+        out_f.write_text(json.dumps(res))
+        return res
+
+    return manager.submit("verbatim", pid, "ai", work, "Listening for pauses and filler words",
+                          key=f"verbatim:{pid}:{start:.2f}:{end:.2f}").to_dict()
+
+
+@app.post("/api/projects/{pid}/spotlights")
+async def spotlights(pid: str, request: Request):
+    """Find the slide elements the speaker talks about during a clip (for the spotlight / click effect)."""
+    import tempfile
+    from . import spotlight
+    body = await request.json()
+    start, end = float(body["start"]), float(body["end"])
+    p = store.load(pid)
+    pres = p["sources"].get("presentation")
+    if not pres:
+        raise HTTPException(400, "This needs the presentation (screen) recording.")
+    words = discover.master_words(p)
+    if not words:
+        raise HTTPException(400, "Transcribe the webinar first (step 3).")
+    off = p["sync"]["offset"]
+
+    def work(job):
+        sents = build_sentences(words)
+        with tempfile.TemporaryDirectory(dir=CACHE / "audio") as td:
+            path, local = keep.resolve(pid, pres, start + off, end + off, "presentation")
+            # local start of the piece -> shift so master time t maps to (t + off) - (start + off) + local
+            shift = local - (start + off)
+            ev = spotlight.find(job, words, sents, p.get("slides_master") or [], path, off + shift, start, end, Path(td))
+        return {"events": ev}
+
+    return manager.submit("spotlight", pid, "media", work, "Finding what he talks about on the slides",
+                          key=f"spot:{pid}:{start:.2f}:{end:.2f}").to_dict()
 
 
 @app.get("/api/projects/{pid}/estimate")
@@ -1058,7 +1192,14 @@ async def render(pid: str, cid: str, plan: UploadFile = File(...), overlays: lis
     start, end = float(spec["start"]), float(spec["end"])
     fps = float(spec.get("fps", 30))
     n = len(spec["frames"])
-    if n < 1 or abs(n / fps - (end - start)) > 0.2:
+    keep_r = None
+    if spec.get("keep"):   # silences / filler words removed: parts to keep, seconds from the clip start
+        keep_r = [[max(0.0, float(a)), min(end - start, float(b))] for a, b in spec["keep"]]
+        keep_r = [r for r in keep_r if r[1] > r[0]]
+        if not keep_r or any(keep_r[i][0] < keep_r[i - 1][1] - 1e-6 for i in range(1, len(keep_r))):
+            raise HTTPException(400, "The removed silences of this clip are out of date. Open Layout & cropping and apply them again.")
+    expected = sum(b - a for a, b in keep_r) if keep_r else end - start
+    if n < 1 or abs(n / fps - expected) > 0.2:
         raise HTTPException(400, "The render plan does not match the clip length. Please reload the page.")
     off = p["sync"]["offset"]
     sources = {}
@@ -1122,7 +1263,7 @@ async def render(pid: str, cid: str, plan: UploadFile = File(...), overlays: lis
         out = d / "exports" / f"{safe}-{time.strftime('%Y%m%d-%H%M%S')}.mp4"
     W, H = (540, 960) if quality == "preview" else (int(spec.get("width", 1080)), int(spec.get("height", 1920)))
     worker_plan = {"out": str(out), "width": W, "height": H, "fps": fps, "frames": spec["frames"],
-                   "sources": sources, "overlays": ovl, "audio": audio, "quality": quality,
+                   "sources": sources, "overlays": ovl, "audio": audio, "quality": quality, "keep": keep_r,
                    "background": spec.get("background", "#000000"),
                    "decode_max_height": 720 if quality == "preview" else 1440}
     plan_f = work_dir / "plan.json"

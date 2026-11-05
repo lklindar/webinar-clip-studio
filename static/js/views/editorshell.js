@@ -1,7 +1,7 @@
 // Shared frame for the editor steps: clip picker + live 9:16 preview.
 import { h, toast, fmtTime } from "../ui.js";
-import { CompositePlayer } from "../player.js";
-import { buildCaptions, applyAutoEdit } from "../clipstate.js";
+import { CompositePlayer, captionProject } from "../player.js";
+import { buildCaptions, applyAutoEdit, dimsOf } from "../clipstate.js";
 
 export async function editorShell(main, ctx, { step, title, intro }) {
   const approved = ctx.approved();
@@ -16,7 +16,7 @@ export async function editorShell(main, ctx, { step, title, intro }) {
   if (clip.needsCaptionRebuild) {
     const tr = await ctx.transcript();
     if (!clip.captionsEdited && tr) {
-      clip.captions = buildCaptions(tr.words, clip.start, clip.end, clip.style.maxWords);
+      clip.captions = buildCaptions(tr.words, clip.start, clip.end, clip.style.maxWords, clip);
       clip.captionsKey = ctx.state.project.transcript?.created || null;
       toast("Subtitles were updated for the new clip timing.");
     } else if (clip.captionsEdited) {
@@ -33,7 +33,7 @@ export async function editorShell(main, ctx, { step, title, intro }) {
     if (!key || clip.captionsKey === key || clip.captionsEdited) return false;
     const tr = await ctx.transcript(true);
     if (!tr) return false;
-    clip.captions = buildCaptions(tr.words, clip.start, clip.end, clip.style.maxWords);
+    clip.captions = buildCaptions(tr.words, clip.start, clip.end, clip.style.maxWords, clip);
     clip.captionsKey = key;
     // the automatic edit cuts at pauses in speech, so redo it once the words are known
     if (clip.autoEdit && !clip.layoutEdited && !clip.autoEditWords) applyAutoEdit(clip, ctx.state.project, tr.words, clip.autoEdit);
@@ -89,6 +89,28 @@ export async function editorShell(main, ctx, { step, title, intro }) {
   drawSave(ctx.saveStatus.get());
   const offSave = ctx.saveStatus.on(drawSave);
   const right = h("div", { class: "stack" });
+  // subtitle height: drag on the preview, or use the buttons / slider under it
+  const posLabel = h("span", { class: "small muted", style: { minWidth: "62px" } });
+  const posSlider = h("input", { type: "range", min: 5, max: 95, step: 1, style: { flex: "1" } });
+  const curPos = () => (clip.smartPos !== false ? captionProject(clip, player.t, dimsOf(ctx.state.project, clip)).style.posY : clip.style.posY);
+  const syncPos = () => { const v = Math.round(curPos() * 100); posSlider.value = v; posLabel.textContent = clip.smartPos !== false ? "auto" : `${v}% ↓`; };
+  const setPos = (y, save = true) => {
+    clip.smartPos = false;
+    clip.style.posY = Math.max(0.05, Math.min(0.95, Math.round(y * 1000) / 1000));
+    syncPos(); player.draw();
+    if (save) { ctx.saveClip(clip); onPosChanged?.(); }
+  };
+  let onPosChanged = null;
+  posSlider.addEventListener("input", () => setPos(posSlider.value / 100, false));
+  posSlider.addEventListener("change", () => setPos(posSlider.value / 100));
+  const posBar = h("div", { class: "row", style: { marginTop: "6px", gap: "6px", flexWrap: "nowrap" } },
+    h("span", { class: "small", style: { fontWeight: 600, whiteSpace: "nowrap" } }, "Subtitle position"),
+    h("button", { class: "btn small", title: "Move subtitles up", onclick: () => setPos(curPos() - 0.02) }, "▲"),
+    h("button", { class: "btn small", title: "Move subtitles down", onclick: () => setPos(curPos() + 0.02) }, "▼"),
+    posSlider, posLabel);
+  player.enableCaptionDrag(() => syncPos(), () => { ctx.saveClip(clip); onPosChanged?.(); });
+  player.onTime(() => { if (clip.smartPos !== false) syncPos(); });
+  syncPos();
   main.append(
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, title), h("p", {}, intro)),
       h("div", { class: "row" }, saveEl, undoBtn, redoBtn, h("span", { class: "small muted", style: { marginLeft: "8px" } }, "Editing"), picker,
@@ -98,9 +120,9 @@ export async function editorShell(main, ctx, { step, title, intro }) {
           if (id) { await ctx.refresh(); ctx.go(step, id); }
         } }, "⧉ Duplicate"))),
     subsBanner,
-    h("div", { class: "editor" }, h("div", { class: "editor-left" }, player.el,
-      h("p", { class: "small muted", style: { marginTop: "6px" } }, "Live preview (low-res). Click the video or press Space to play/pause.")), right));
+    h("div", { class: "editor" }, h("div", { class: "editor-left" }, player.el, posBar,
+      h("p", { class: "small muted", style: { marginTop: "6px" } }, "Live preview (low-res). Click the video or press Space to play/pause. Drag the subtitles up or down on the video to move them.")), right));
   const changed = (redraw = true) => { ctx.saveClip(clip); if (redraw) player.draw(); };
-  return { clip, player, right, changed, setOnCaptionsChanged: (fn) => { onCaptionsChanged = fn; },
+  return { clip, player, right, changed, syncPos, setOnPosChanged: (fn) => { onPosChanged = fn; }, setOnCaptionsChanged: (fn) => { onCaptionsChanged = fn; },
     cleanup: () => { offSave(); offHist(); window.__editingClip = null; offProj(); clearInterval(bannerTimer); ctx.saveClip.flush?.(clip); player.destroy(); window.__player = null; } };
 }

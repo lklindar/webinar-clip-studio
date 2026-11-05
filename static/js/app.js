@@ -380,7 +380,7 @@ async function renderHome(main) {
       h("h1", {}, "Turn long webinars into vertical short clips"),
       h("p", {}, "Add your speaker and presentation recordings. Pick the minutes you want (or let the app suggest moments), and it helps you compose 9:16 videos with burned-in subtitles for TikTok, Reels and Shorts."),
       h("div", { class: "flow" }, ["Upload", "Sync", "Choose clips", "Review AI ideas (optional)", "Layout", "Subtitles", "Export MP4"].map((s, i) => h("span", {}, `${i + 1}. ${s}`)))),
-    continueBox,
+    continueBox || "",
     h("div", { class: "card section" },
       h("h3", {}, "Start a new project"),
       h("div", { class: "row" }, nameInp, h("button", { class: "btn primary", onclick: create }, "Create project"))),

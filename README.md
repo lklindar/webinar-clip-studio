@@ -57,8 +57,13 @@ The small preview copies stay, so you can still watch the whole webinar. If you 
      (one `start - end name` per line). Only these minutes are transcribed for subtitles — seconds
      instead of 10–15 minutes for a whole hour. If you lengthen a clip later, just the new part is
      transcribed. You go straight to step 5; subtitles appear automatically when ready.
-   - **Let the app suggest moments**: full local transcription (faster‑whisper, cached) plus clip
-     discovery with your chosen provider (see below).
+   - **Let the app suggest moments**: full local transcription (faster‑whisper, cached), then an AI reads
+     the **whole webinar** and returns ranked clips with a theme title, viral potential, the speaker's key
+     sentence (exact words from the transcript), why it works, an on‑screen hook, a ready caption and
+     editing tips — written in English. Clip length presets go up to
+     3 minutes. **✨ Your AI chat (free, recommended):** copy the ready‑made request (it contains the
+     transcript), paste it into Gemini / ChatGPT / Claude.ai, paste the answer back. **Claude (built in)**
+     does the same automatically with an API key. Offline rules and local models remain as fallbacks.
    **⬇ Download** (next to each of your clips): the clip's raw footage, cut exactly to its start/end —
    the speaker video, the screen recording (sync offset applied), and — once the person cutout is
    prepared — the speaker on a green screen (MP4), with a transparent background as a small HEVC .mov
@@ -67,7 +72,7 @@ The small preview copies stay, so you can still watch the whole webinar. If you 
 4. **Review AI ideas** (optional, only for suggestions) — sort/filter ideas, read the verbatim transcript, the suggested hook
    (clearly marked as *not* spoken), reasons, sub‑scores, confidence and caveats. Preview,
    adjust start/end (snap to sentence), approve/reject, find more, or add your own clip.
-5. **Layout & cropping** — every new clip gets an automatic **Auto-edit** (Calm / Dynamic /
+5. **Layout & cropping** — **🔦 Spotlight on what he talks about**: reads the slide text on your Mac (Apple Vision), matches it with what is said, and spotlights that element (rest of the slide dimmed and softened) with a click ring. **Subtitle position**: drag the subtitles on the preview or use ▲ ▼ / the slider under it. **🎬 Edit style**: *Standard* (full 9:16) or *Header & safe zone* — a title + logo band on top, slides full width, the camera below, an empty band at the bottom for the app buttons, and one-word subtitles with key words (abbreviations, numbers and your own list) in orange. every new clip gets an automatic **Auto-edit** (Calm / Dynamic /
    Energetic): layout changes on a rhythm, cut at pauses in speech, slides full screen when they
    change, speaker punch-ins on questions and strong statements, slow zooms, and a slow glide across
    static slides so the screen recording never looks frozen. Undo it or fine-tune any part.

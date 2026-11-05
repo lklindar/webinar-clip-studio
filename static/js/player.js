@@ -1,9 +1,10 @@
 // Live composite preview: two synced <video> proxies drawn onto a 9:16 canvas using the
 // same layout ops (compose.js) and caption renderer (captions.js) as the export.
-import { opsAt, captionY, visualAt, mediaKey, assetOf, cutoutFor, usesCutout, OUT_W, OUT_H } from "./compose.js";
+import { opsAt, captionY, visualAt, mediaKey, assetOf, cutoutFor, usesCutout, OUT_W, OUT_H, frameOn } from "./compose.js";
 import { drawCard } from "./visuals.js";
 import { renderAt } from "./captions.js";
 import { h, fmtTime } from "./ui.js";
+import { clipDur, toSrc, toEdit } from "./cuts.js";
 
 const small = document.createElement("canvas");
 const sctx = small.getContext("2d");
@@ -42,6 +43,40 @@ function drawPacked(ctx, packEl, op, dx, dy, dw, dh) {
   ctx.drawImage(cutA, dx, dy, dw, dh);
 }
 
+// spotlight: soften + dim the visible slide except the element being talked about
+function drawSpot(ctx, W, H, op, dx, dy, dw, dh) {
+  const [sx, sy, sw, sh] = [op.spot[0] * W, op.spot[1] * H, op.spot[2] * W, op.spot[3] * H];
+  const a = op.a ?? 1;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(dx, dy, dw, dh);
+  ctx.rect(sx + sw, sy, -sw, sh);   // hole (opposite winding)
+  ctx.clip("evenodd");
+  ctx.globalAlpha = a;
+  ctx.filter = `blur(${Math.max(1, W * 0.004)}px)`;
+  ctx.drawImage(ctx.canvas, dx, dy, dw, dh, dx, dy, dw, dh);
+  ctx.filter = "none";
+  ctx.fillStyle = `rgba(0,0,0,${op.dim ?? 0.5})`;
+  ctx.fillRect(dx, dy, dw, dh);
+  ctx.restore();
+  ctx.save();
+  ctx.globalAlpha = 0.9 * a;
+  ctx.strokeStyle = "#FFFFFF";
+  ctx.lineWidth = Math.max(1, W * 0.003);
+  ctx.strokeRect(sx, sy, sw, sh);
+  ctx.restore();
+}
+// click ring
+function drawRing(ctx, W, H, op) {
+  const a = op.a ?? 1, r = op.rad * W;
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.beginPath(); ctx.arc(op.ring[0] * W, op.ring[1] * H, r, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(245,165,36,0.5)"; ctx.fill();
+  ctx.lineWidth = Math.max(2, W * 0.009); ctx.strokeStyle = "#FFFFFF"; ctx.stroke();
+  ctx.restore();
+}
+
 export function drawOps(ctx, W, H, ops, sources, bg = "#000") {
   ctx.save();
   ctx.fillStyle = bg;
@@ -50,6 +85,8 @@ export function drawOps(ctx, W, H, ops, sources, bg = "#000") {
     const [dx, dy, dw, dh] = [op.d[0] * W, op.d[1] * H, op.d[2] * W, op.d[3] * H];
     ctx.globalAlpha = op.a ?? 1;
     if (op.fill) { ctx.fillStyle = op.fill; ctx.fillRect(dx, dy, dw, dh); continue; }
+    if (op.spot) { drawSpot(ctx, W, H, op, dx, dy, dw, dh); continue; }
+    if (op.ring) { drawRing(ctx, W, H, op); continue; }
     if (op.m && sources[op.m]?.pack && sources[op.m].ready()) {
       ctx.save();
       if (op.r) { ctx.beginPath(); ctx.rect(op.r[0] * W, op.r[1] * H, op.r[2] * W, op.r[3] * H); ctx.clip(); }
@@ -91,9 +128,57 @@ export function captionProject(clip, t, dims) {
   return { captions: clip.captionsOn === false ? [] : clip.captions || [], style, hook: clip.hook, emphasis: clip.emphasis };
 }
 
-// Everything drawn on top of the video: illustration cards, then subtitles. Returns true if anything was drawn.
-export function drawOverlay(ctx, W, H, clip, t, dims) {
+// ---------------------------------------------------------------- header (title + logo) of the "Header & safe zone" style
+const headerImgs = new Map();
+export function headerImage(url) {
+  if (!url) return null;
+  if (!headerImgs.has(url)) {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.src = url;
+    headerImgs.set(url, img);
+  }
+  return headerImgs.get(url);
+}
+export async function ensureHeader(clip) {
+  const img = frameOn(clip) && clip.header?.on ? headerImage(clip.header.logoUrl) : null;
+  if (img && !img.complete) await new Promise((r) => { img.onload = img.onerror = r; });
+}
+function drawHeader(ctx, W, H, clip) {
+  const hd = clip.header;
+  if (!frameOn(clip) || !hd?.on) return false;
+  const band = H * (clip.frame.top ?? 0.155);
+  const x0 = W * 0.05;
   let drew = false;
+  const img = headerImage(hd.logoUrl);
+  const logoH = band * 0.3;
+  if (img && img.complete && img.naturalWidth) {
+    const lw = logoH * img.naturalWidth / img.naturalHeight;
+    ctx.drawImage(img, x0, band * 0.42, Math.min(lw, W * 0.4), logoH);
+    drew = true;
+  }
+  const title = (hd.title || "").trim();
+  if (title) {
+    let size = band * (hd.sizePct ?? 0.17);
+    const font = (sz) => `400 ${sz}px "${hd.font || "DM Serif Display"}", Georgia, serif`;
+    ctx.font = font(size);
+    const maxW = W * 0.9;
+    while (ctx.measureText(title).width > maxW && size > band * 0.08) { size *= 0.94; ctx.font = font(size); }
+    ctx.save();
+    ctx.fillStyle = hd.color || "#FFFFFF";
+    ctx.textBaseline = "alphabetic";
+    ctx.shadowColor = "rgba(0,0,0,0.45)";
+    ctx.shadowBlur = size * 0.15;
+    ctx.fillText(title, x0, band * 0.93);
+    ctx.restore();
+    drew = true;
+  }
+  return drew;
+}
+
+// Everything drawn on top of the video: header, illustration cards, then subtitles. Returns true if anything was drawn.
+export function drawOverlay(ctx, W, H, clip, t, dims) {
+  let drew = drawHeader(ctx, W, H, clip);
   const v = visualAt(clip, t, dims);
   if (v) {
     const k = W / OUT_W, kh = H / OUT_H;
@@ -128,9 +213,10 @@ export class CompositePlayer {
       const dur = s.duration;
       this.sources[key] = {
         el: v, offset, role, dur,
-        timeAt: (t) => this.clip.start + t + offset,           // clip time -> this video's time
-        clipTime: (vt) => vt - offset - this.clip.start,       // this video's time -> clip time
-        inRange: (t) => this.clip.start + t + offset >= 0 && this.clip.start + t + offset <= dur,
+        timeAt: (t) => this.clip.start + toSrc(this.clip, t) + offset,           // clip time -> this video's time
+        clipTime: (vt) => toEdit(this.clip, vt - offset - this.clip.start),      // this video's time -> clip time
+        srcOf: (vt) => vt - offset - this.clip.start,                            // this video's time -> source time
+        inRange: (t) => { const x = this.clip.start + toSrc(this.clip, t) + offset; return x >= 0 && x <= dur; },
         ready: () => v.readyState >= 2 && this.sources[key].visible !== false,
       };
       v.addEventListener("seeked", () => { if (!this.playing) this.draw(); });
@@ -139,7 +225,7 @@ export class CompositePlayer {
     this.audioKey = project.sync.audio === "presentation" ? "pres" : "spk";
     this.el = h("div", { class: "player" }, h("div", { class: "canvas-wrap" }, this.canvas));
     if (controls) this.el.append(this._controls());
-    this.canvas.addEventListener("click", () => this.toggle());
+    this.canvas.addEventListener("click", () => { if (this._dragged) { this._dragged = false; return; } this.toggle(); });
   }
 
   _controls() {
@@ -151,6 +237,36 @@ export class CompositePlayer {
   }
 
   onTime(fn) { this.listeners.push(fn); }
+
+  // Drag the subtitles up or down directly on the preview. onMove(posY) while dragging, onDone(posY) at the end.
+  enableCaptionDrag(onMove, onDone) {
+    const cv = this.canvas;
+    const yOf = (e) => { const r = cv.getBoundingClientRect(); return (e.clientY - r.top) / r.height; };
+    const capY = () => this.clip && this.clip.captionsOn !== false && (this.clip.captions || []).length
+      ? captionProject(this.clip, this.t, this.dims).style.posY : null;
+    const near = (y) => { const c = capY(); return c != null && Math.abs(y - c) < 0.07; };
+    let drag = null;
+    cv.addEventListener("pointermove", (e) => {
+      if (drag) {
+        const y = Math.max(0.05, Math.min(0.95, drag.p0 + yOf(e) - drag.y0));
+        if (Math.abs(yOf(e) - drag.y0) > 0.005) this._dragged = true;
+        this.clip.smartPos = false;
+        this.clip.style.posY = Math.round(y * 1000) / 1000;
+        this.draw();
+        onMove?.(this.clip.style.posY);
+      } else cv.style.cursor = near(yOf(e)) ? "ns-resize" : "";
+    });
+    cv.addEventListener("pointerdown", (e) => {
+      const y = yOf(e);
+      if (!near(y)) return;
+      cv.setPointerCapture(e.pointerId);
+      drag = { y0: y, p0: capY() };
+      this._dragged = false;
+    });
+    const end = () => { if (!drag) return; drag = null; if (this._dragged) onDone?.(this.clip.style.posY); };
+    cv.addEventListener("pointerup", end);
+    cv.addEventListener("pointercancel", end);
+  }
 
   // Your assets (images / short videos) used by "media" parts of the clip.
   _syncAssets() {
@@ -207,8 +323,8 @@ export class CompositePlayer {
       this.dims.cutmask = { w: cut.width, h: cut.height };
       this.sources.cutmask = {
         el: v, cutId: cut.id, dur: cut.end - cut.start, mask: true, pack: true,
-        timeAt: (t) => this.clip.start + t - cut.start,
-        clipTime: (vt) => vt + cut.start - this.clip.start,
+        timeAt: (t) => this.clip.start + toSrc(this.clip, t) - cut.start,
+        clipTime: (vt) => toEdit(this.clip, vt + cut.start - this.clip.start),
         inRange: () => true,
         ready: () => v.readyState >= 2,
       };
@@ -227,13 +343,13 @@ export class CompositePlayer {
   setClip(clip) {
     this.clip = clip;
     this._syncAssets();
-    const dur = clip.end - clip.start;
+    const dur = clipDur(clip);
     if (this.scrub) this.scrub.max = dur.toFixed(2);
     if (this.t > dur) this.t = 0;
     this.seek(this.t);
   }
 
-  duration() { return this.clip ? this.clip.end - this.clip.start : 0; }
+  duration() { return this.clip ? clipDur(this.clip) : 0; }
 
   seek(t) {
     if (!this.clip) return;
@@ -274,6 +390,10 @@ export class CompositePlayer {
       if (master && !master.el.paused && master.inRange(this.t) && master.el.readyState >= 3) {
         t = master.clipTime(master.el.currentTime);
         this.clock0 = performance.now() - t * 1000;
+        // reached a removed part (silence / filler): jump every recording to the next kept part
+        if (master.srcOf && !master.el.seeking && Math.abs(master.srcOf(master.el.currentTime) - toSrc(this.clip, t)) > 0.06) {
+          for (const s of Object.values(this.sources)) if (!s.image && !s.asset) s.el.currentTime = s.timeAt(t);
+        }
       } else {
         t = (performance.now() - this.clock0) / 1000;
       }

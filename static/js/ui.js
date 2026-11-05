@@ -1,5 +1,14 @@
 // Small DOM helpers (no framework).
 
+// Views often write box.append(a, cond ? b : null). The browser would print such a null as the text "null",
+// so skip empty children here just like h() does.
+for (const proto of [Element.prototype, DocumentFragment.prototype]) {
+  for (const name of ["append", "prepend"]) {
+    const orig = proto[name];
+    proto[name] = function (...nodes) { return orig.apply(this, nodes.flat(Infinity).filter((n) => n !== null && n !== undefined && n !== false)); };
+  }
+}
+
 export function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {

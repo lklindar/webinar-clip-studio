@@ -17,7 +17,7 @@ export async function render(main, ctx) {
 
   const a = p.analysis || {};
   const banner = a.semantic
-    ? h("div", { class: "alert info" }, `Suggestions by ${a.provider === "anthropic" ? "Claude" : "a local AI model"} (${a.model}). `,
+    ? h("div", { class: "alert info" }, `Suggestions by ${a.provider === "anthropic" ? "Claude" : a.provider === "chat" ? "your AI chat" : "a local AI model"} (${a.model}). `,
       "Scores are heuristic judgements of hook strength, clarity, standalone value, usefulness and engagement — not predictions of views. Nothing guarantees a clip will go viral.")
     : h("div", { class: "alert warn" }, "Suggestions by the offline rules (not semantic AI). The scores reflect simple patterns and are only a rough guide — please judge each clip yourself. Nothing guarantees a clip will go viral.");
 
@@ -117,9 +117,21 @@ export async function render(main, ctx) {
           c.status === "approved" ? h("span", { class: "chip ok" }, "✓ approved") : null,
           c.status === "rejected" ? h("span", { class: "chip bad" }, "rejected") : null,
           h("span", { class: "spacer" }),
-          h("span", { class: "small muted" }, c.source === "heuristic" ? "offline rules" : c.source === "manual" ? "added by you" : c.source)),
+          h("span", { class: "small muted" }, c.source === "heuristic" ? "offline rules" : c.source === "manual" ? "added by you" : c.source?.startsWith("chat:") ? `from ${c.source.slice(5)}` : c.source)),
+        c.title ? h("h3", { style: { margin: "8px 0 2px" } }, c.title,
+          c.viral ? h("span", { class: "chip " + (c.viral === "very_high" ? "ok" : c.viral === "high" ? "accent" : ""), style: { marginLeft: "8px", verticalAlign: "middle" } },
+            { very_high: "🔥 Very high potential", high: "High potential", medium: "Medium potential" }[c.viral]) : null) : null,
+        c.key_text ? h("div", { class: "quote", style: { borderLeft: "3px solid var(--ok)", fontStyle: "italic", color: "var(--ink)" } },
+          h("span", { class: "lbl" }, "Key sentence — the speaker's exact words"), "“", c.key_text, "”") : null,
         hookLbl && c.hook ? h("div", { class: "hookbox" }, h("span", { class: "lbl" }, hookLbl), h("b", {}, c.hook)) : null,
-        c.why ? h("p", { style: { margin: "6px 0" } }, h("b", {}, "Why it may work: "), c.why) : null,
+        c.why ? h("p", { style: { margin: "6px 0" } }, h("b", {}, "Why it works: "), c.why) : null,
+        c.caption ? h("div", { class: "row", style: { margin: "6px 0", alignItems: "flex-start" } },
+          h("div", { style: { flex: "1" } }, h("b", {}, "Caption / text on screen: "), h("i", {}, c.caption)),
+          h("button", { class: "btn small", onclick: async () => {
+            try { await navigator.clipboard.writeText(c.caption); toast("Caption copied", "ok", 1500); } catch { toast("Couldn't copy — select the text instead.", "error"); }
+          } }, "📋 Copy")) : null,
+        c.tips?.length ? h("div", { style: { margin: "6px 0" } }, h("b", {}, "Editing tips: "),
+          h("ul", { style: { margin: "4px 0", paddingLeft: "20px" } }, c.tips.map((x) => h("li", {}, x)))) : null,
         c.scores ? h("div", { class: "subs" }, Object.entries(SUB_LABELS).map(([k, l]) => h("div", { class: "sub" }, `${l} ${c.scores[k]}/10`,
           h("div", { class: "bar" }, h("i", { style: { width: `${c.scores[k] * 10}%` } }))))) : null,
         c.caveats?.length ? h("ul", { class: "caveats" }, c.caveats.map((x) => h("li", {}, "⚠ " + x))) : null,
@@ -171,6 +183,13 @@ export async function render(main, ctx) {
 
   async function findMore() {
     moreBox.innerHTML = "";
+    if (p.analysis?.provider === "chat" || !p.analysis) {
+      // ideas came from your own AI chat: ask it again for different moments
+      try { localStorage.setItem("wcs.chooseMode", "ai"); localStorage.setItem("wcs.askMore", "1"); } catch { /* ignore */ }
+      toast("Copy the request again — “Add to my current ideas” is ticked, so the AI is asked for different moments.", "info", 7000);
+      ctx.go("analyze");
+      return;
+    }
     try {
       const sys = ctx.state.system;
       const job = await api(`/api/projects/${p.id}/discover`, { json: { more: true, count: 5, provider: p.analysis?.provider || sys?.settings.provider } });
